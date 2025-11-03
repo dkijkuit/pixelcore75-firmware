@@ -101,6 +101,13 @@ bool buttonPressed = false;
 
 unsigned long lastReconnectAttempt = 0;
 
+static constexpr int W = 64;
+static constexpr int H = 32;
+static constexpr size_t FRAME_BYTES = W * H * 2;
+
+uint8_t  rxBuf[FRAME_BYTES];      // raw bytes from MQTT
+uint16_t *px = (uint16_t*)rxBuf;  // view as RGB565 pixels (little-endian)
+
 bool init_wifi(char ssid[], char password[]);
 void onConnect(BLEServer *pServer);
 void onDisconnect(BLEServer *pServer);
@@ -428,44 +435,10 @@ void callback(char *topic, byte *payload, unsigned int length) {
       return;
     }
 
-    // 1. Allocate message buffer
-    char *message = (char *)malloc(length + 1);
-    if (!message) {
-      Serial.println("Failed to allocate message buffer");
-      return;
-    }
-
-    // 2. Copy payload and null-terminate
-    memcpy(message, payload, length);
-    message[length] = '\0';
-
-    // 3. Allocate array for 16-bit ints
-    uint16_t *intArray = (uint16_t *)malloc(MAX_VALUES * sizeof(uint16_t));
-    if (!intArray) {
-      Serial.println("Failed to allocate int array");
-      free(message);
-      return;
-    }
-
-    // 4. Parse hex values
-    int index = 0;
-    char *token = strtok(message, ",");
-    while (token != NULL && index < MAX_VALUES) {
-      long val = strtol(token, NULL, 16);
-      intArray[index++] = (uint16_t)val;
-      token = strtok(NULL, ",");
-    }
-
-    Serial.printf("Parsed %d values\n", index);
-    Serial.println();
-
-    writeFile(LittleFS, "/last.png", intArray);
-    readFile(LittleFS, "/last.png");
-
-    Serial.println();
-    // 5. Clean up
-    free(message);
-    free(intArray);
+    if (length != FRAME_BYTES) return;          // ignore malformed frames
+    memcpy(rxBuf, payload, FRAME_BYTES);
+    
+    dma_display -> drawRGBBitmap(0, 0, px, W, H);
   }
 }
 
