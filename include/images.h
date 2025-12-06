@@ -303,14 +303,6 @@ const uint16_t epd_bitmap_connected [] PROGMEM = {
 	0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000
 };
 
-// Array of all bitmaps for convenience. (Total bytes used to store images in PROGMEM = 4128)
-const int epd_bitmap_allArray_LEN = 2;
-const uint16_t* epd_bitmap_allArray[2] = {
-	epd_bitmap_connected,
-	epd_bitmap_connecting
-};
-
-
 // 'bluetooth_icon', 32x32px
 const uint16_t epd_bitmap_bluetooth_icon[] PROGMEM = {
 	0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
