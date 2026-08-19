@@ -106,8 +106,59 @@ static constexpr int W = 64;
 static constexpr int H = 32;
 static constexpr size_t FRAME_BYTES = W * H * 2;
 
+static constexpr uint32_t ANIM_MAGIC = 0x4D494E41;       // "ANIM" little-endian
+static constexpr uint32_t ANIM_FRAME_MAGIC = 0x46494E41; // "ANIF" little-endian
+static constexpr uint32_t ANIM_PLAY_MAGIC = 0x50494E41;  // "ANIP" little-endian
+static constexpr const char *TOPIC_ANIM_START = "/anim/start";
+static constexpr const char *TOPIC_ANIM_FRAME = "/anim/frame";
+static constexpr const char *TOPIC_ANIM_PLAY = "/anim/play";
+static constexpr const char *TOPIC_ANIM_LOADED = "/anim/loaded";
+static constexpr const char *ANIM_UPLOAD_PATH = "/anim_up.bin"; // staging file while an upload is in flight
+static constexpr uint8_t ANIM_MAX_SLOTS = 32; // persistent animation slots; capacity-bound, eviction self-heals via re-upload
+static constexpr size_t ANIM_FILE_HEADER_BYTES = 4; // frameCount(u16) + delayMs(u16)
+static constexpr size_t ANIM_START_PAYLOAD = 14;    // magic + frameCount + delayMs + uploadId + flags + slot
+static constexpr size_t ANIM_FRAME_PAYLOAD = 6 + FRAME_BYTES; // magic + frameIdx + pixels
+static constexpr size_t ANIM_PLAY_PAYLOAD = 9;      // magic + slot + uploadId
+static constexpr size_t ANIM_LOADED_PAYLOAD = 9;    // magic + slot + uploadId
+static constexpr uint8_t ANIM_FLAG_STAGE_ONLY = 0x01; // stage to flash but wait for /anim/play
+static constexpr uint16_t MAX_ANIM_FRAMES = 200;    // sanity cap; ~800KB fits the ~4.9MB LittleFS many times over
+static constexpr uint16_t ANIM_MIN_DELAY_MS = 10;
+static constexpr size_t ANIM_RING_FRAMES = 8;  // RAM frame ring (8*4KB): decouples MQTT from flash writes
+static constexpr size_t ANIM_FLUSH_CHUNK = 256; // one flash page per loop pass while an animation plays
+
 uint8_t rxBuf[FRAME_BYTES];       // raw bytes from MQTT
 uint16_t *px = (uint16_t *)rxBuf; // view as RGB565 pixels (little-endian)
+
+bool animActive = false;
+bool animUploading = false;
+bool animLoadedAckPending = false;
+uint32_t animUploadId = 0;
+bool animStageOnly = false;     // current upload stages but doesn't play on completion
+uint8_t animSlot = 0;           // slot the current upload writes to
+uint8_t animPlayingSlot = 0;    // slot currently playing (auto-resume after reconnect/reboot)
+uint8_t animAckSlot = 0;        // ack payload while animLoadedAckPending
+uint32_t animAckUploadId = 0;   // ack payload while animLoadedAckPending
+uint32_t animPlayRequestId = 0; // /anim/play that arrived while the upload was still running
+uint16_t animUploadCount = 0;
+uint16_t animExpectedIdx = 0;
+uint16_t animFrameCount = 0;
+uint16_t animFrameIdx = 0;
+uint16_t animDelayMs = 0;
+unsigned long animLastFrameMs = 0;
+uint8_t animBuf[FRAME_BYTES];
+File animFile;
+File animUploadFile; // staging file, held open for the whole upload (per-frame open/close starves the animation loop)
+
+// Upload ring: the MQTT callback only copies frames into RAM; loop() flushes them to
+// flash in small budgeted chunks. Flash writes stall both cores (page programs ~0.5ms,
+// block erases tens of ms), so doing them inline in the callback froze the animation
+// tick for the whole 4KB frame. Backpressure: loop() stops calling client.loop() when
+// the ring is nearly full, so TCP/MQTT flow control throttles the server instead.
+uint8_t animRing[ANIM_RING_FRAMES][FRAME_BYTES];
+size_t animRingHead = 0;       // next free frame (writer: MQTT callback)
+size_t animRingTail = 0;       // oldest buffered frame (reader: loop flusher)
+size_t animRingCount = 0;      // frames buffered
+size_t animRingFlushed = 0;    // bytes of the tail frame already written to flash
 
 bool init_wifi(char ssid[], char password[]);
 void onConnect(BLEServer *pServer);
@@ -122,6 +173,17 @@ void reconnect();
 void init_display();
 void verifyRegistration();
 bool check_bluetooth_button_pressed();
+const char *getClientId();
+void stopAnimation(bool removeFile);
+void abortAnimUpload();
+void playSlot(uint8_t slot, uint32_t uploadId);
+void startAnimation(uint8_t slot);
+void animationTick();
+void animUploadFlush();
+void completeAnimUpload();
+void handleAnimStart(const byte *payload, unsigned int length);
+void handleAnimFrame(const byte *payload, unsigned int length);
+void handleAnimPlay(const byte *payload, unsigned int length);
 
 void drawBitmap(
     int16_t x,
@@ -156,12 +218,13 @@ bool init_wifi(char ssid[], char password[])
   Serial.println();
   Serial.print("Waiting for WiFi... ");
 
+  const unsigned long wifiStartMs = millis();
   while (wiFiMulti.run() != WL_CONNECTED)
   {
     Serial.print(".");
     delay(500);
 
-    if (millis() > 1000)
+    if (millis() - wifiStartMs > 15000)
       break;
   }
 
@@ -488,24 +551,371 @@ void setAsciiValue(BLECharacteristic *ch, const String &val)
   ch->setValue((uint8_t *)val.c_str(), val.length());
 }
 
-void callback(char *topic, byte *payload, unsigned int length)
+void abortAnimUpload()
 {
-  if (updateScreen)
-  {
-    Serial.printf("Received %u bytes on topic %s\n", length, topic);
+  animUploading = false;
+  animStageOnly = false;
+  animPlayRequestId = 0;
+  animRingHead = animRingTail = animRingCount = 0;
+  animRingFlushed = 0;
+  if (animUploadFile)
+    animUploadFile.close();
+  LittleFS.remove(ANIM_UPLOAD_PATH);
+}
 
-    if (length > MAX_PAYLOAD_SIZE)
+/** Path of a slot file. Single static buffer: the firmware is single-threaded (MQTT callback
+ *  runs inside client.loop() from loop()), and no two slot paths are held simultaneously. */
+static const char *animSlotPath(uint8_t slot)
+{
+  static char buf[12]; // "/a31.bin" + NUL, with headroom
+  snprintf(buf, sizeof(buf), "/a%u.bin", slot);
+  return buf;
+}
+
+void playSlot(uint8_t slot, uint32_t uploadId)
+{
+  if (slot >= ANIM_MAX_SLOTS)
+    return;
+
+  Serial.printf("Animation play requested: slot %u\n", slot);
+  startAnimation(slot);
+  if (animActive)
+  {
+    animAckSlot = slot;
+    animAckUploadId = uploadId;
+    animLoadedAckPending = true;
+  }
+}
+
+void stopAnimation(bool removePlayingSlot)
+{
+  bool wasUploading = animUploading;
+  animActive = false;
+  animUploading = false;
+  animLoadedAckPending = false;
+  if (animFile)
+    animFile.close();
+  if (removePlayingSlot)
+    LittleFS.remove(animSlotPath(animPlayingSlot));
+  if (wasUploading)
+    abortAnimUpload(); // staging is stale once the upload state resets
+}
+
+void animationTick()
+{
+  if (!animActive)
+    return;
+  if (millis() - animLastFrameMs < animDelayMs)
+    return;
+  // Catch-up cadence: advance by exactly one delay so a stall (e.g. a flash erase
+  // during an upload) holds one frame instead of permanently slowing the animation.
+  animLastFrameMs += animDelayMs;
+  if (millis() - animLastFrameMs >= animDelayMs)
+    animLastFrameMs = millis(); // fell a full frame or more behind: resync, don't fast-forward
+
+  size_t offset = ANIM_FILE_HEADER_BYTES + (size_t)animFrameIdx * FRAME_BYTES;
+  if (!animFile.seek(offset) || animFile.read(animBuf, FRAME_BYTES) != FRAME_BYTES)
+  {
+    stopAnimation(true);
+    return;
+  }
+
+  dma_display->drawRGBBitmap(0, 0, (uint16_t *)animBuf, W, H);
+  currentScreenImage = ScreenImage::Client;
+  animFrameIdx = (animFrameIdx + 1) % animFrameCount;
+}
+
+void startAnimation(uint8_t slot)
+{
+  if (slot >= ANIM_MAX_SLOTS)
+    return;
+  stopAnimation(false);
+
+  const char *path = animSlotPath(slot);
+  if (!LittleFS.exists(path))
+    return;
+
+  File f = LittleFS.open(path, FILE_READ);
+  if (!f)
+    return;
+
+  uint8_t hdr[ANIM_FILE_HEADER_BYTES];
+  bool valid = f.size() >= ANIM_FILE_HEADER_BYTES + FRAME_BYTES &&
+               f.seek(0) &&
+               f.read(hdr, ANIM_FILE_HEADER_BYTES) == ANIM_FILE_HEADER_BYTES;
+  if (valid)
+  {
+    animFrameCount = hdr[0] | (hdr[1] << 8);
+    animDelayMs = hdr[2] | (hdr[3] << 8);
+    valid = animFrameCount >= 2 && animFrameCount <= MAX_ANIM_FRAMES &&
+            f.size() == ANIM_FILE_HEADER_BYTES + (size_t)animFrameCount * FRAME_BYTES;
+  }
+  if (!valid)
+  {
+    f.close();
+    LittleFS.remove(path);
+    return;
+  }
+
+  if (animDelayMs < ANIM_MIN_DELAY_MS)
+    animDelayMs = ANIM_MIN_DELAY_MS;
+
+  animPlayingSlot = slot;
+  animFile = f;
+  animFrameIdx = 0;
+  animLastFrameMs = 0;
+  animActive = true;
+  animationTick();
+}
+
+void handleAnimStart(const byte *payload, unsigned int length)
+{
+  if (length != ANIM_START_PAYLOAD)
+    return;
+
+  uint32_t magic;
+  memcpy(&magic, payload, sizeof(magic));
+  if (magic != ANIM_MAGIC)
+    return;
+
+  uint16_t count = payload[4] | (payload[5] << 8);
+  uint16_t delayMs = payload[6] | (payload[7] << 8);
+  uint32_t uploadId = (uint32_t)payload[8] | ((uint32_t)payload[9] << 8) |
+                      ((uint32_t)payload[10] << 16) | ((uint32_t)payload[11] << 24);
+  bool stageOnly = (payload[12] & ANIM_FLAG_STAGE_ONLY) != 0;
+  uint8_t slot = payload[13];
+  if (slot >= ANIM_MAX_SLOTS)
+    return;
+  if (count < 2 || count > MAX_ANIM_FRAMES)
+    return;
+  if (delayMs < ANIM_MIN_DELAY_MS)
+    delayMs = ANIM_MIN_DELAY_MS;
+
+  // Stage into a second file so the currently playing animation (or static screen) is
+  // unaffected during the upload; the swap onto the slot file happens on the last frame
+  // (immediate play) or later on /anim/play (stage-only uploads).
+  if (animUploading)
+    abortAnimUpload(); // superseded by a new upload: close the old handle before re-staging
+  animPlayRequestId = 0;
+  LittleFS.remove(ANIM_UPLOAD_PATH); // stale partial upload from an earlier attempt
+
+  // Space ladder for the staging file: drop the slot file being replaced first, then idle
+  // slot files, and only as a last resort the playing animation.
+  size_t needed = ANIM_FILE_HEADER_BYTES + (size_t)count * FRAME_BYTES;
+  auto freeOk = [&]() { return LittleFS.totalBytes() - LittleFS.usedBytes() >= needed; };
+  LittleFS.remove(animSlotPath(slot));
+  if (!freeOk())
+    for (uint8_t s = 0; s < ANIM_MAX_SLOTS && !freeOk(); s++)
+      if (s != slot && !(animActive && s == animPlayingSlot))
+        LittleFS.remove(animSlotPath(s));
+  if (!freeOk() && animActive)
+    stopAnimation(false); // sacrifice the playing animation, keep its file for last
+  if (!freeOk())
+    LittleFS.remove(animSlotPath(animPlayingSlot));
+  if (!freeOk())
+    return;
+
+  File f = LittleFS.open(ANIM_UPLOAD_PATH, FILE_WRITE);
+  if (!f)
+    return;
+
+  uint8_t hdr[ANIM_FILE_HEADER_BYTES] = {
+      (uint8_t)(count & 0xFF), (uint8_t)(count >> 8),
+      (uint8_t)(delayMs & 0xFF), (uint8_t)(delayMs >> 8)};
+  bool ok = f.write(hdr, ANIM_FILE_HEADER_BYTES) == ANIM_FILE_HEADER_BYTES;
+  if (!ok)
+  {
+    f.close();
+    LittleFS.remove(ANIM_UPLOAD_PATH);
+    return;
+  }
+  animUploadFile = f; // kept open until the upload completes or aborts
+
+  Serial.printf("Animation upload started: slot %u, %u frames, %u ms delay%s\n",
+                slot, count, delayMs, stageOnly ? " (stage-only)" : "");
+
+  animUploadId = uploadId;
+  animStageOnly = stageOnly;
+  animSlot = slot;
+  animUploadCount = count;
+  animExpectedIdx = 0;
+  animUploading = true;
+}
+
+void handleAnimFrame(const byte *payload, unsigned int length)
+{
+  if (!animUploading || length != ANIM_FRAME_PAYLOAD)
+    return;
+
+  uint32_t magic;
+  memcpy(&magic, payload, sizeof(magic));
+  if (magic != ANIM_FRAME_MAGIC)
+    return;
+
+  uint16_t idx = payload[4] | (payload[5] << 8);
+  if (idx != animExpectedIdx)
+    return;
+
+  // Ring only; the flash write happens in loop() (animUploadFlush). Flow control
+  // (gated client.loop()) keeps a slot free, a full ring here means it failed.
+  if (animRingCount >= ANIM_RING_FRAMES)
+  {
+    abortAnimUpload(); // next anim/start can retry cleanly
+    return;
+  }
+
+  memcpy(animRing[animRingHead], payload + 6, FRAME_BYTES);
+  animRingHead = (animRingHead + 1) % ANIM_RING_FRAMES;
+  animRingCount++;
+  animExpectedIdx++;
+}
+
+/** Drains the upload ring to flash. While an animation plays, only one page per loop
+ *  pass so the write stalls stay small and the animation tick keeps its cadence; with
+ *  the display idle it drains freely. Finalizes the upload once the last byte lands. */
+void animUploadFlush()
+{
+  if (!animUploading)
+    return;
+
+  size_t budget = animActive ? ANIM_FLUSH_CHUNK : FRAME_BYTES;
+  while (animRingCount > 0 && budget > 0)
+  {
+    size_t chunk = FRAME_BYTES - animRingFlushed;
+    if (chunk > budget)
+      chunk = budget;
+    if (!animUploadFile || animUploadFile.write(animRing[animRingTail] + animRingFlushed, chunk) != chunk)
     {
-      Serial.println("Payload exceeds supported size");
+      // Keep the playing animation running; the next anim/start can retry cleanly.
+      abortAnimUpload();
       return;
     }
-
-    if (length != FRAME_BYTES)
-      return; // ignore malformed frames
-    memcpy(rxBuf, payload, FRAME_BYTES);
-
-    dma_display->drawRGBBitmap(0, 0, px, W, H);
+    animRingFlushed += chunk;
+    budget -= chunk;
+    if (animRingFlushed >= FRAME_BYTES)
+    {
+      animRingFlushed = 0;
+      animRingTail = (animRingTail + 1) % ANIM_RING_FRAMES;
+      animRingCount--;
+    }
   }
+
+  if (animRingCount == 0 && animExpectedIdx >= animUploadCount)
+    completeAnimUpload();
+}
+
+/** Last frame drained: swap the staging file onto the slot file and ack/play. */
+void completeAnimUpload()
+{
+  Serial.println("Animation upload complete");
+  animUploading = false; // before stopAnimation, so staging is preserved
+  animUploadFile.close();
+
+  // Replacing the slot the animation is currently playing from: stop playback first,
+  // LittleFS refuses remove/rename on an open file.
+  if (animActive && animPlayingSlot == animSlot)
+    stopAnimation(false);
+
+  LittleFS.remove(animSlotPath(animSlot)); // replace the slot's previous content
+  if (!LittleFS.rename(ANIM_UPLOAD_PATH, animSlotPath(animSlot)))
+  {
+    Serial.println("Animation rename failed");
+    return;
+  }
+
+  // Ack the staging completion so the server knows the content landed.
+  if (animStageOnly)
+  {
+    Serial.println("Animation staged");
+    animAckSlot = animSlot;
+    animAckUploadId = animUploadId;
+    animLoadedAckPending = true;
+    if (animPlayRequestId == animUploadId)
+      playSlot(animSlot, animUploadId); // /anim/play raced ahead of the final frames
+    return;
+  }
+
+  playSlot(animSlot, animUploadId);
+}
+
+void handleAnimPlay(const byte *payload, unsigned int length)
+{
+  if (length != ANIM_PLAY_PAYLOAD)
+    return;
+
+  uint32_t magic;
+  memcpy(&magic, payload, sizeof(magic));
+  if (magic != ANIM_PLAY_MAGIC)
+    return;
+
+  uint8_t slot = payload[4];
+  uint32_t uploadId = (uint32_t)payload[5] | ((uint32_t)payload[6] << 8) |
+                      ((uint32_t)payload[7] << 16) | ((uint32_t)payload[8] << 24);
+  if (slot >= ANIM_MAX_SLOTS)
+    return;
+
+  if (animUploading && uploadId == animUploadId && slot == animSlot)
+  {
+    // Frames are still arriving; play as soon as the upload completes.
+    animPlayRequestId = uploadId;
+    return;
+  }
+
+  // Play whatever the slot holds: the server only skips the upload when the slot's
+  // content is unchanged (persistent cache), so no id match is needed here.
+  playSlot(slot, uploadId);
+}
+
+void callback(char *topic, byte *payload, unsigned int length)
+{
+  if (!updateScreen)
+  {
+    Serial.println("MQTT message dropped: updateScreen disabled");
+    return;
+  }
+
+  const char *base = getClientId();
+  size_t baseLen = strlen(base);
+  if (strncmp(topic, base, baseLen) == 0)
+  {
+    const char *suffix = topic + baseLen;
+    if (strcmp(suffix, TOPIC_ANIM_START) == 0)
+    {
+      handleAnimStart(payload, length);
+      return;
+    }
+    if (strcmp(suffix, TOPIC_ANIM_FRAME) == 0)
+    {
+      handleAnimFrame(payload, length);
+      return;
+    }
+    if (strcmp(suffix, TOPIC_ANIM_PLAY) == 0)
+    {
+      handleAnimPlay(payload, length);
+      return;
+    }
+  }
+
+  Serial.printf("Received %u bytes on topic %s\n", length, topic);
+
+  if (length > MAX_PAYLOAD_SIZE)
+  {
+    Serial.println("Payload exceeds supported size");
+    return;
+  }
+
+  if (length != FRAME_BYTES)
+  {
+    Serial.printf("Frame dropped: %u bytes, expected %u\n", length, FRAME_BYTES);
+    return; // ignore malformed frames
+  }
+
+  // A static frame stops playback but keeps the slot files: they are a persistent
+  // cache, and the server skips re-uploads while their content is unchanged.
+  stopAnimation(false);
+  memcpy(rxBuf, payload, FRAME_BYTES);
+
+  dma_display->drawRGBBitmap(0, 0, px, W, H);
 }
 
 void init_broker_connection()
@@ -558,6 +968,10 @@ const char *getClientId()
     Serial.println(WiFi.macAddress());
     Serial.print("-> Client ID / Serial: ");
     Serial.println(client_id);
+    Serial.print("-> MQTT topic (frame): ");
+    Serial.println(client_id);
+    Serial.print("-> MQTT topics (anim): ");
+    Serial.printf("%s%s, %s%s\r\n", client_id, TOPIC_ANIM_START, client_id, TOPIC_ANIM_FRAME);
     Serial.println();
     Serial.println();
   }
@@ -646,7 +1060,19 @@ void reconnect()
       Serial.println("connected");
       drawBitmap(0, 0, epd_bitmap_connected, 64, 32, ScreenImage::Connected, true);
       drawBitmap(48, 23, epd_bitmap_check_mark, 8, 8, ScreenImage::Checkmark, false);
-      client.subscribe(getClientId());
+      Serial.printf("Subscribed to %s: %s\n", getClientId(), client.subscribe(getClientId()) ? "ok" : "FAILED");
+      char animStartTopic[48];
+      char animFrameTopic[48];
+      char animPlayTopic[48];
+      snprintf(animStartTopic, sizeof(animStartTopic), "%s%s", getClientId(), TOPIC_ANIM_START);
+      snprintf(animFrameTopic, sizeof(animFrameTopic), "%s%s", getClientId(), TOPIC_ANIM_FRAME);
+      snprintf(animPlayTopic, sizeof(animPlayTopic), "%s%s", getClientId(), TOPIC_ANIM_PLAY);
+      Serial.printf("Subscribed to %s: %s\n", animStartTopic, client.subscribe(animStartTopic) ? "ok" : "FAILED");
+      Serial.printf("Subscribed to %s: %s\n", animFrameTopic, client.subscribe(animFrameTopic) ? "ok" : "FAILED");
+      Serial.printf("Subscribed to %s: %s\n", animPlayTopic, client.subscribe(animPlayTopic) ? "ok" : "FAILED");
+      if (animUploading)
+        abortAnimUpload(); // an in-flight upload died with the connection; completed staging survives
+      startAnimation(animPlayingSlot); // slot files persist across reconnects
     }
     else
     {
@@ -698,6 +1124,11 @@ void setup()
     Serial.println("LittleFS Mount Failed");
     return;
   }
+
+  LittleFS.remove(ANIM_UPLOAD_PATH); // any staging file is stale after a reboot
+  LittleFS.remove("/anim.bin");      // legacy pre-slot animation file, reclaim its space
+  Serial.printf("LittleFS: %u / %u bytes used\n",
+                (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes());
 
   preferences.begin("cryptoticker", false);
 
@@ -762,7 +1193,31 @@ void loop()
     {
       init_broker_connection();
     }
-    client.loop();
+    animUploadFlush(); // make ring space before pulling more frames off the socket
+
+    // Flow control: with the ring nearly full, hold off client.loop() (which delivers
+    // at most one publish per call). TCP/MQTT backpressure then throttles the server
+    // until the flusher catches up; PINGREQ/PUBACK also pause briefly, which is fine.
+    if (!(animUploading && animRingCount >= ANIM_RING_FRAMES - 1))
+      client.loop();
+
+    if (animLoadedAckPending && client.connected())
+    {
+      char animLoadedTopic[48];
+      snprintf(animLoadedTopic, sizeof(animLoadedTopic), "%s%s", getClientId(), TOPIC_ANIM_LOADED);
+      uint8_t animLoadedPayload[ANIM_LOADED_PAYLOAD] = {
+          'A', 'N', 'I', 'L',
+          animAckSlot,
+          (uint8_t)(animAckUploadId & 0xFF), (uint8_t)(animAckUploadId >> 8),
+          (uint8_t)(animAckUploadId >> 16), (uint8_t)(animAckUploadId >> 24)};
+      if (client.publish(animLoadedTopic, animLoadedPayload, sizeof(animLoadedPayload)))
+      {
+        animLoadedAckPending = false;
+        Serial.println("Animation loaded ack published");
+      }
+    }
+
+    animationTick();
   }
   else
   {
