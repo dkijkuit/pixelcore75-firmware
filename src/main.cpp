@@ -129,6 +129,32 @@ static constexpr size_t ANIM_PLAY_PAYLOAD = 9;      // magic + slot + uploadId
 static constexpr size_t ANIM_LOADED_PAYLOAD = 9;    // magic + slot + uploadId
 static constexpr uint32_t SLOTIDX_MAGIC = 0x49544C53;       // "SLTI" little-endian
 static constexpr const char *SLOTIDX_PATH = "/slotidx.bin"; // per-slot uploadId index: content-hash cache for /anim/play
+static constexpr uint32_t ACMD_MAGIC = 0x444D4341; // "ACMD" little-endian (parametric command batch)
+static constexpr uint8_t ACMD_VERSION = 1;         // wrong version drops the whole batch
+static constexpr const char *TOPIC_CMD = "/cmd";   // server-rendered command channel (QoS 0, not retained)
+static constexpr size_t ACMD_HEADER_BYTES = 7;     // magic(u32) + version(u8) + cmdCount(u16 LE)
+static constexpr size_t ACMD_FONT_PAGES = 4;       // RAM font page slots (0..3), replaceable, not persisted
+static constexpr uint16_t ACMD_GLYPH_ABSENT = 0xFFFF; // codeOff[] marker: glyph not in page
+static constexpr unsigned long ACMD_TICK_MS = 10;  // parametric tick floor (~10-30 ms cadence from loop())
+enum AcmdOpcode : uint8_t
+{
+  ACMD_NOP = 0x00,
+  ACMD_CLS = 0x01,
+  ACMD_PIX = 0x02,
+  ACMD_LINE = 0x03,
+  ACMD_RECT = 0x04,
+  ACMD_FILL = 0x05,
+  ACMD_CIRC = 0x06,
+  ACMD_BLIT = 0x07,
+  ACMD_FONT = 0x10,
+  ACMD_TEXT = 0x11,
+  ACMD_SWEEP = 0x20,
+  ACMD_SCROLL = 0x21,
+  ACMD_BLINK = 0x22
+};
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 static constexpr uint8_t SLOTIDX_VERSION = 1;
 static constexpr size_t SLOTIDX_FILE_BYTES = 5 + ANIM_MAX_SLOTS * 4; // magic + version + one u32 uploadId per slot
 static constexpr uint8_t ANIM_FLAG_STAGE_ONLY = 0x01; // stage to flash but wait for /anim/play
@@ -185,6 +211,36 @@ size_t animRingTail = 0;       // oldest buffered frame (reader: loop flusher)
 size_t animRingCount = 0;      // frames buffered
 size_t animRingFlushed = 0;    // bytes of the tail frame already written to flash
 
+// ACMD parametric command engine: batches render into the work canvas and commit
+// atomically (base canvas swap + display push + parametric arming). The base canvas is
+// immutable after commit, so parametric overlays (SWEEP/SCROLL/BLINK) composite over a
+// fresh copy of it every tick — that copy also IS the "region snapshot restore" of the
+// SCROLL/BLINK semantics (their snapshots equal the base region at commit time).
+uint16_t acmdBase[W * H]; // committed frame
+uint16_t acmdWork[W * H]; // batch render scratch + parametric composite buffer
+struct AcmdFontPage
+{
+  bool present;           // at least one FONT command has loaded this page (RAM only, never persisted)
+  uint8_t *glyphs;        // packed records: code,w,h,xAdvance,xOff,yOff + h*ceil(w/8) bitmap bytes
+  size_t glyphsLen;
+  uint16_t codeOff[256];  // record offset per char code; ACMD_GLYPH_ABSENT = not in page
+};
+AcmdFontPage acmdFonts[ACMD_FONT_PAGES]; // static storage: zero-initialized (present = false)
+enum AcmdParamType { ACMD_PARAM_NONE = 0, ACMD_PARAM_SWEEP, ACMD_PARAM_SCROLL, ACMD_PARAM_BLINK };
+bool acmdActive = false;
+AcmdParamType acmdParam = ACMD_PARAM_NONE;
+unsigned long acmdCommitMs = 0;   // parametric state derives from elapsed ms since commit
+unsigned long acmdLastDrawMs = 0; // tick throttle (cadence jitter must not affect the render)
+uint8_t acmdSwCx = 0, acmdSwCy = 0, acmdSwR = 0, acmdSwSpeed = 0;
+uint16_t acmdSwColor = 0;
+uint8_t acmdScX = 0, acmdScY = 0, acmdScW = 0, acmdScH = 0, acmdScFontId = 0;
+uint16_t acmdScColor = 0, acmdScSpeedMs = 0;
+uint8_t acmdScLen = 0;
+char acmdScText[256]; // SCROLL text scratch: 255 chars + NUL
+int32_t acmdScTextW = 0; // sum of glyph advances (+4 per unknown glyph)
+uint8_t acmdBlX = 0, acmdBlY = 0, acmdBlW = 0, acmdBlH = 0;
+uint16_t acmdBlPeriodMs = 0;
+
 bool init_wifi(char ssid[], char password[]);
 void onConnect(BLEServer *pServer);
 void onDisconnect(BLEServer *pServer);
@@ -209,6 +265,8 @@ void completeAnimUpload();
 void handleAnimStart(const byte *payload, unsigned int length);
 void handleAnimFrame(const byte *payload, unsigned int length);
 void handleAnimPlay(const byte *payload, unsigned int length);
+void handleAcmd(const byte *payload, unsigned int length);
+void acmdTick();
 
 void drawBitmap(
     int16_t x,
@@ -680,6 +738,7 @@ void stopAnimation(bool removePlayingSlot)
 {
   bool wasUploading = animUploading;
   animActive = false;
+  acmdActive = false; // static frames, animation starts and reconnect auto-resume supersede ACMD
   animPlayingV2 = false;
   animUploading = false;
   animLoadedAckPending = false;
@@ -1209,6 +1268,615 @@ void handleAnimPlay(const byte *payload, unsigned int length)
   playSlot(slot, uploadId);
 }
 
+// **************************************
+// ACMD v1 — parametric command engine
+//
+// Server-rendered command batches on <base>/cmd, executed on a RAM canvas that mirrors
+// Adafruit_GFX pixel-for-pixel (the server's Java preview renderer transcribes the same
+// algorithms from the same source): writeLine Bresenham with steep swap + err = dx/2,
+// fillRect as per-column vlines, drawCircle's 4 initial + 8 symmetric writes, int16
+// arithmetic, out-of-bounds pixels silently dropped. A whole batch renders into the
+// work canvas and commits atomically; any violation drops the batch and keeps the
+// prior display. The FIRST parametric primitive (SWEEP/SCROLL/BLINK) in a batch wins;
+// later ones are validated but ignored.
+// **************************************
+
+static inline uint16_t acmdU16(const uint8_t *p)
+{
+  return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static inline void acmdSwapI16(int16_t &a, int16_t &b)
+{
+  int16_t t = a;
+  a = b;
+  b = t;
+}
+
+/** Bounds-checked canvas write — the mirror of GFX drawPixel (drop, never clip-run). */
+static void acmdPixel(uint16_t *cv, int32_t x, int32_t y, uint16_t color)
+{
+  if (x >= 0 && x < W && y >= 0 && y < H)
+    cv[y * W + x] = color;
+}
+
+/** Adafruit_GFX::writeLine transcribed: steep swap, x0<=x1 ordering, err = dx/2. */
+static void acmdWriteLine(uint16_t *cv, int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint16_t color)
+{
+  int16_t adx = (x1 > x0) ? (x1 - x0) : (x0 - x1);
+  int16_t ady = (y1 > y0) ? (y1 - y0) : (y0 - y1);
+  bool steep = ady > adx;
+  if (steep)
+  {
+    acmdSwapI16(x0, y0);
+    acmdSwapI16(x1, y1);
+  }
+  if (x0 > x1)
+  {
+    acmdSwapI16(x0, x1);
+    acmdSwapI16(y0, y1);
+  }
+  int16_t dx = x1 - x0;
+  int16_t dy = (y1 > y0) ? (y1 - y0) : (y0 - y1);
+  int16_t err = dx / 2;
+  int16_t ystep = (y0 < y1) ? 1 : -1;
+  for (; x0 <= x1; x0++)
+  {
+    if (steep)
+      acmdPixel(cv, y0, x0, color);
+    else
+      acmdPixel(cv, x0, y0, color);
+    err -= dy;
+    if (err < 0)
+    {
+      y0 += ystep;
+      err += dx;
+    }
+  }
+}
+
+/** Adafruit_GFX::drawRect: four fast lines, each a writeLine. */
+static void acmdDrawRect(uint16_t *cv, int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color)
+{
+  acmdWriteLine(cv, x, y, x + w - 1, y, color);
+  acmdWriteLine(cv, x, y + h - 1, x + w - 1, y + h - 1, color);
+  acmdWriteLine(cv, x, y, x, y + h - 1, color);
+  acmdWriteLine(cv, x + w - 1, y, x + w - 1, y + h - 1, color);
+}
+
+/** Adafruit_GFX::fillRect: one vline per column. Degenerate sizes keep the GFX quirk:
+ *  h = 0 paints rows y-1 and y (swapped writeLine), w = 0 still iterates once per GFX. */
+static void acmdFillRect(uint16_t *cv, int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color)
+{
+  for (int16_t i = x; i < x + w; i++)
+    acmdWriteLine(cv, i, y, i, y + h - 1, color);
+}
+
+/** Adafruit_GFX::drawCircle transcribed: 4 initial writes + 8 symmetric per step. */
+static void acmdDrawCircle(uint16_t *cv, int16_t x0, int16_t y0, int16_t r, uint16_t color)
+{
+  int16_t f = 1 - r;
+  int16_t ddF_x = 1;
+  int16_t ddF_y = -2 * r;
+  int16_t x = 0;
+  int16_t y = r;
+
+  acmdPixel(cv, x0, y0 + r, color);
+  acmdPixel(cv, x0, y0 - r, color);
+  acmdPixel(cv, x0 + r, y0, color);
+  acmdPixel(cv, x0 - r, y0, color);
+
+  while (x < y)
+  {
+    if (f >= 0)
+    {
+      y--;
+      ddF_y += 2;
+      f += ddF_y;
+    }
+    x++;
+    ddF_x += 2;
+    f += ddF_x;
+
+    acmdPixel(cv, x0 + x, y0 + y, color);
+    acmdPixel(cv, x0 - x, y0 + y, color);
+    acmdPixel(cv, x0 + x, y0 - y, color);
+    acmdPixel(cv, x0 - x, y0 - y, color);
+    acmdPixel(cv, x0 + y, y0 + x, color);
+    acmdPixel(cv, x0 - y, y0 + x, color);
+    acmdPixel(cv, x0 + y, y0 - x, color);
+    acmdPixel(cv, x0 - y, y0 - x, color);
+  }
+}
+
+/** Draw one FONT-page glyph record (code,w,h,xAdvance,xOff,yOff + MSB-first bitmap):
+ *  pixels at (penX + xOff + gx, topY + yOff + gy); optional rect clip (SCROLL region). */
+static void acmdDrawGlyph(uint16_t *cv, const uint8_t *rec, int32_t penX, int32_t topY,
+                          uint16_t color, bool clip, int32_t cx, int32_t cy, int32_t cw, int32_t ch)
+{
+  int32_t w = rec[1];
+  int32_t h = rec[2];
+  int32_t ox = penX + (int8_t)rec[4];
+  int32_t oy = topY + (int8_t)rec[5];
+  const uint8_t *bmp = rec + 6;
+  for (int32_t gy = 0; gy < h; gy++)
+  {
+    for (int32_t gx = 0; gx < w; gx++)
+    {
+      if (!((bmp[gy * ((w + 7) / 8) + (gx >> 3)] >> (7 - (gx & 7))) & 1))
+        continue;
+      int32_t X = ox + gx;
+      int32_t Y = oy + gy;
+      if (clip && (X < cx || X >= cx + cw || Y < cy || Y >= cy + ch))
+        continue;
+      acmdPixel(cv, X, Y, color);
+    }
+  }
+}
+
+/** ACMD v1 batch parser. FIXED commands: opcode + fixed args. PAYLOAD commands
+ *  (BLIT/FONT/TEXT/SCROLL): opcode + payloadLen u16 LE + fixedArgs + payload, where
+ *  payloadLen counts ONLY the trailing payload bytes. Any opcode outside the v1 table
+ *  stops parsing and commits the parsed prefix; any truncation or out-of-bounds
+ *  argument drops the whole batch and keeps the prior display. */
+void handleAcmd(const byte *payload, unsigned int length)
+{
+  if (length < ACMD_HEADER_BYTES)
+    return;
+  uint32_t magic;
+  memcpy(&magic, payload, sizeof(magic));
+  if (magic != ACMD_MAGIC || payload[4] != ACMD_VERSION)
+    return;
+  uint16_t cmdCount = acmdU16(payload + 5);
+  size_t pos = ACMD_HEADER_BYTES;
+
+  memset(acmdWork, 0, sizeof(acmdWork)); // each batch fully describes the frame (starts black)
+
+  // Parametric candidate — collected during parse, applied to the live state only at
+  // commit so a dropped batch never corrupts a running overlay.
+  AcmdParamType candParam = ACMD_PARAM_NONE;
+  uint8_t cSwCx = 0, cSwCy = 0, cSwR = 0, cSwSpeed = 0;
+  uint16_t cSwColor = 0;
+  uint8_t cScX = 0, cScY = 0, cScW = 0, cScH = 0, cScFontId = 0;
+  uint16_t cScColor = 0, cScSpeedMs = 0;
+  uint8_t cScLen = 0;
+  char cScText[256];
+  int32_t cScTextW = 0;
+  uint8_t cBlX = 0, cBlY = 0, cBlW = 0, cBlH = 0;
+  uint16_t cBlPeriodMs = 0;
+
+  bool stopParsing = false;
+  for (uint16_t ci = 0; ci < cmdCount && !stopParsing; ci++)
+  {
+    if (pos >= length)
+      return; // truncation → drop whole batch, keep prior display
+    uint8_t op = payload[pos++];
+    switch (op)
+    {
+    case ACMD_NOP:
+      break;
+
+    case ACMD_CLS:
+    {
+      if (pos + 2 > length)
+        return;
+      uint16_t color = acmdU16(payload + pos);
+      pos += 2;
+      for (size_t i = 0; i < W * H; i++)
+        acmdWork[i] = color;
+      break;
+    }
+
+    case ACMD_PIX:
+    {
+      if (pos + 4 > length)
+        return;
+      uint8_t x = payload[pos], y = payload[pos + 1];
+      uint16_t color = acmdU16(payload + pos + 2);
+      pos += 4;
+      acmdPixel(acmdWork, x, y, color);
+      break;
+    }
+
+    case ACMD_LINE:
+    {
+      if (pos + 6 > length)
+        return;
+      uint8_t x0 = payload[pos], y0 = payload[pos + 1], x1 = payload[pos + 2], y1 = payload[pos + 3];
+      uint16_t color = acmdU16(payload + pos + 4);
+      pos += 6;
+      acmdWriteLine(acmdWork, x0, y0, x1, y1, color);
+      break;
+    }
+
+    case ACMD_RECT:
+    {
+      if (pos + 6 > length)
+        return;
+      uint8_t x = payload[pos], y = payload[pos + 1], w = payload[pos + 2], h = payload[pos + 3];
+      uint16_t color = acmdU16(payload + pos + 4);
+      pos += 6;
+      acmdDrawRect(acmdWork, x, y, w, h, color);
+      break;
+    }
+
+    case ACMD_FILL:
+    {
+      if (pos + 6 > length)
+        return;
+      uint8_t x = payload[pos], y = payload[pos + 1], w = payload[pos + 2], h = payload[pos + 3];
+      uint16_t color = acmdU16(payload + pos + 4);
+      pos += 6;
+      acmdFillRect(acmdWork, x, y, w, h, color);
+      break;
+    }
+
+    case ACMD_CIRC:
+    {
+      if (pos + 5 > length)
+        return;
+      uint8_t cx = payload[pos], cy = payload[pos + 1], r = payload[pos + 2];
+      uint16_t color = acmdU16(payload + pos + 3);
+      pos += 5;
+      acmdDrawCircle(acmdWork, cx, cy, r, color);
+      break;
+    }
+
+    case ACMD_BLIT:
+    {
+      if (pos + 2 > length)
+        return;
+      uint16_t payLen = acmdU16(payload + pos);
+      pos += 2;
+      if (pos + 4 + (size_t)payLen > length)
+        return;
+      uint8_t x = payload[pos], y = payload[pos + 1], w = payload[pos + 2], h = payload[pos + 3];
+      pos += 4;
+      const uint8_t *pay = payload + pos;
+      pos += payLen;
+
+      if (payLen < PAL_RLE_PALETTE_BYTES || ((payLen - PAL_RLE_PALETTE_BYTES) & 1) != 0)
+        return;
+      uint16_t pal[16];
+      for (uint8_t c = 0; c < 16; c++)
+        pal[c] = acmdU16(pay + 2 * c);
+      // Structural validation: runs never cross rows, each row sums to exactly w,
+      // run 1..w, colorIdx 0..15, and the pairs cover all w*h pixels.
+      const uint8_t *pairs = pay + PAL_RLE_PALETTE_BYTES;
+      size_t pairCount = (payLen - PAL_RLE_PALETTE_BYTES) / 2;
+      uint16_t row = 0;
+      uint16_t rowsDone = 0;
+      for (size_t i = 0; i < pairCount; i++)
+      {
+        uint8_t run = pairs[2 * i], idx = pairs[2 * i + 1];
+        if (run < 1 || run > w || idx > 15)
+          return;
+        row += run;
+        if (row > w)
+          return;
+        if (row == w)
+        {
+          row = 0;
+          rowsDone++;
+        }
+      }
+      if (row != 0 || rowsDone != h)
+        return;
+      // Decode and blit at (x,y), canvas-clipped (out-of-bounds dropped).
+      uint16_t col = 0;
+      uint16_t rowIdx = 0;
+      for (size_t i = 0; i < pairCount; i++)
+      {
+        uint16_t color = pal[pairs[2 * i + 1]];
+        for (uint8_t k = 0; k < pairs[2 * i]; k++)
+        {
+          acmdPixel(acmdWork, (int32_t)x + col, (int32_t)y + rowIdx, color);
+          if (++col == w)
+          {
+            col = 0;
+            rowIdx++;
+          }
+        }
+      }
+      break;
+    }
+
+    case ACMD_FONT:
+    {
+      if (pos + 2 > length)
+        return;
+      uint16_t payLen = acmdU16(payload + pos);
+      pos += 2;
+      if (pos + (size_t)payLen > length)
+        return; // no fixed args for FONT
+      const uint8_t *pay = payload + pos;
+      pos += payLen;
+
+      if (payLen < 2)
+        return;
+      uint8_t pageId = pay[0], glyphCount = pay[1];
+      if (pageId >= ACMD_FONT_PAGES)
+        return;
+      // Pass 1: validate layout (w/h 1..32) and exact payload consumption.
+      size_t gpos = 2;
+      for (uint16_t g = 0; g < glyphCount; g++)
+      {
+        if (gpos + 6 > payLen)
+          return;
+        uint8_t w = pay[gpos + 1], h = pay[gpos + 2];
+        if (w < 1 || w > 32 || h < 1 || h > 32)
+          return;
+        gpos += 6 + (size_t)h * ((w + 7) / 8);
+      }
+      if (gpos != payLen)
+        return;
+      // Pass 2: stage the page, then swap in (a malloc failure keeps the old page).
+      size_t total = payLen - 2;
+      uint8_t *buf = total > 0 ? (uint8_t *)malloc(total) : nullptr;
+      if (total > 0 && !buf)
+        return;
+      static uint16_t tmpOff[256]; // single-threaded firmware: shared scratch is safe
+      for (uint16_t c = 0; c < 256; c++)
+        tmpOff[c] = ACMD_GLYPH_ABSENT;
+      if (total > 0)
+        memcpy(buf, pay + 2, total);
+      size_t off = 0;
+      for (uint16_t g = 0; g < glyphCount; g++)
+      {
+        tmpOff[buf[off]] = off; // duplicate codes: last one wins
+        off += 6 + (size_t)buf[off + 2] * ((buf[off + 1] + 7) / 8);
+      }
+      AcmdFontPage &pg = acmdFonts[pageId];
+      free(pg.glyphs);
+      pg.present = true;
+      pg.glyphs = buf;
+      pg.glyphsLen = total;
+      memcpy(pg.codeOff, tmpOff, sizeof(pg.codeOff));
+      break;
+    }
+
+    case ACMD_TEXT:
+    {
+      if (pos + 2 > length)
+        return;
+      uint16_t payLen = acmdU16(payload + pos);
+      pos += 2;
+      if (pos + 5 + (size_t)payLen > length)
+        return;
+      uint8_t fontId = payload[pos], x = payload[pos + 1], y = payload[pos + 2];
+      uint16_t color = acmdU16(payload + pos + 3);
+      pos += 5;
+      const uint8_t *pay = payload + pos;
+      pos += payLen;
+
+      if (fontId >= ACMD_FONT_PAGES)
+        return;
+      const AcmdFontPage &pg = acmdFonts[fontId];
+      if (!pg.present)
+        return; // missing page → drop batch
+      if (payLen < 1 || pay[0] < 1 || (size_t)payLen != 1 + pay[0])
+        return;
+      int32_t penX = x;
+      for (uint8_t i = 0; i < pay[0]; i++)
+      {
+        uint16_t off = pg.codeOff[pay[1 + i]];
+        if (off != ACMD_GLYPH_ABSENT)
+        {
+          acmdDrawGlyph(acmdWork, pg.glyphs + off, penX, y, color, false, 0, 0, 0, 0);
+          penX += (int8_t)pg.glyphs[off + 3];
+        }
+        else
+          penX += 4; // unknown glyph: advance, draw nothing
+      }
+      break;
+    }
+
+    case ACMD_SWEEP:
+    {
+      if (pos + 6 > length)
+        return;
+      uint8_t cx = payload[pos], cy = payload[pos + 1], r = payload[pos + 2];
+      uint16_t color = acmdU16(payload + pos + 3);
+      uint8_t speed = payload[pos + 5];
+      pos += 6;
+      if (speed < 1)
+        return; // spec: 1..255
+      if (candParam == ACMD_PARAM_NONE)
+      {
+        candParam = ACMD_PARAM_SWEEP;
+        cSwCx = cx;
+        cSwCy = cy;
+        cSwR = r;
+        cSwColor = color;
+        cSwSpeed = speed;
+      }
+      break;
+    }
+
+    case ACMD_SCROLL:
+    {
+      if (pos + 2 > length)
+        return;
+      uint16_t payLen = acmdU16(payload + pos);
+      pos += 2;
+      if (pos + 9 + (size_t)payLen > length)
+        return;
+      uint8_t x = payload[pos], y = payload[pos + 1], w = payload[pos + 2], h = payload[pos + 3];
+      uint8_t fontId = payload[pos + 4];
+      uint16_t color = acmdU16(payload + pos + 5);
+      uint16_t speedMs = acmdU16(payload + pos + 7);
+      pos += 9;
+      const uint8_t *pay = payload + pos;
+      pos += payLen;
+
+      if (fontId >= ACMD_FONT_PAGES)
+        return;
+      const AcmdFontPage &pg = acmdFonts[fontId];
+      if (!pg.present)
+        return; // missing page → drop batch
+      if (payLen < 1 || pay[0] < 1 || (size_t)payLen != 1 + pay[0])
+        return;
+      if (speedMs < 1)
+        return; // divide-by-zero guard
+      // textWidth = Σ advance: glyph xAdvance (signed), +4 per unknown glyph.
+      int32_t textW = 0;
+      for (uint8_t i = 0; i < pay[0]; i++)
+      {
+        uint16_t off = pg.codeOff[pay[1 + i]];
+        textW += (off != ACMD_GLYPH_ABSENT) ? (int8_t)pg.glyphs[off + 3] : 4;
+      }
+      if ((int32_t)w + textW + 1 < 1)
+        return; // cycle length must be ≥ 1 (all-negative advances)
+      if (candParam == ACMD_PARAM_NONE)
+      {
+        candParam = ACMD_PARAM_SCROLL;
+        cScX = x;
+        cScY = y;
+        cScW = w;
+        cScH = h;
+        cScFontId = fontId;
+        cScColor = color;
+        cScSpeedMs = speedMs;
+        cScLen = pay[0];
+        memcpy(cScText, pay + 1, cScLen);
+        cScText[cScLen] = 0;
+        cScTextW = textW;
+      }
+      break;
+    }
+
+    case ACMD_BLINK:
+    {
+      if (pos + 6 > length)
+        return;
+      uint8_t x = payload[pos], y = payload[pos + 1], w = payload[pos + 2], h = payload[pos + 3];
+      uint16_t periodMs = acmdU16(payload + pos + 4);
+      pos += 6;
+      if (periodMs < 1)
+        return;
+      if (candParam == ACMD_PARAM_NONE)
+      {
+        candParam = ACMD_PARAM_BLINK;
+        cBlX = x;
+        cBlY = y;
+        cBlW = w;
+        cBlH = h;
+        cBlPeriodMs = periodMs;
+      }
+      break;
+    }
+
+    default:
+      // Opcode not in the v1 table → stop parsing and commit the parsed prefix.
+      // (Forward-compat: future opcodes must be payload-form so extended parsers can
+      // skip them as fixedArgsLen + 2 + payloadLen; a v1 parser cannot, so it stops.)
+      stopParsing = true;
+      break;
+    }
+  }
+
+  // Commit: swap work into base, stop animation playback (slot files kept), arm the
+  // winning parametric, push the frame. Everything after this point is live state.
+  memcpy(acmdBase, acmdWork, sizeof(acmdBase));
+  stopAnimation(false);
+  acmdParam = candParam;
+  acmdSwCx = cSwCx;
+  acmdSwCy = cSwCy;
+  acmdSwR = cSwR;
+  acmdSwColor = cSwColor;
+  acmdSwSpeed = cSwSpeed;
+  acmdScX = cScX;
+  acmdScY = cScY;
+  acmdScW = cScW;
+  acmdScH = cScH;
+  acmdScFontId = cScFontId;
+  acmdScColor = cScColor;
+  acmdScSpeedMs = cScSpeedMs;
+  acmdScLen = cScLen;
+  memcpy(acmdScText, cScText, cScLen + 1);
+  acmdScTextW = cScTextW;
+  acmdBlX = cBlX;
+  acmdBlY = cBlY;
+  acmdBlW = cBlW;
+  acmdBlH = cBlH;
+  acmdBlPeriodMs = cBlPeriodMs;
+  acmdCommitMs = millis();
+  acmdLastDrawMs = acmdCommitMs;
+  acmdActive = true;
+  currentScreenImage = ScreenImage::Client;
+  dma_display->drawRGBBitmap(0, 0, acmdWork, W, H);
+  Serial.printf("ACMD committed: %u commands%s\n", cmdCount,
+                acmdParam == ACMD_PARAM_NONE ? "" : " + parametric");
+}
+
+/** Parametric overlay tick (~10 ms floor, called from loop()): composites the overlay
+ *  over a fresh copy of the immutable base canvas and pushes it. All animation state
+ *  derives from elapsed milliseconds since commit — never from tick counts — so loop
+ *  cadence jitter cannot drift or stall the sweep/scroll/blink phase. */
+void acmdTick()
+{
+  if (!acmdActive || acmdParam == ACMD_PARAM_NONE)
+    return;
+  unsigned long now = millis();
+  if (now - acmdLastDrawMs < ACMD_TICK_MS)
+    return;
+  acmdLastDrawMs = now;
+  unsigned long elapsed = now - acmdCommitMs;
+
+  // Restores the SCROLL/BLINK region snapshots: base is immutable after commit, so a
+  // full copy is exactly the snapshot-restore semantics.
+  memcpy(acmdWork, acmdBase, sizeof(acmdWork));
+  switch (acmdParam)
+  {
+  case ACMD_PARAM_SWEEP:
+  {
+    // θ = (elapsedMs × speed / 1000) mod 360; endpoint in double, lround (half away
+    // from zero); GFX line from the center over the base each tick.
+    uint32_t deg = (uint32_t)(((uint64_t)elapsed * acmdSwSpeed / 1000) % 360);
+    double rad = (double)deg * M_PI / 180.0;
+    int16_t ex = (int16_t)lround((double)acmdSwCx + (double)acmdSwR * cos(rad));
+    int16_t ey = (int16_t)lround((double)acmdSwCy + (double)acmdSwR * sin(rad));
+    acmdWriteLine(acmdWork, acmdSwCx, acmdSwCy, ex, ey, acmdSwColor);
+    break;
+  }
+  case ACMD_PARAM_SCROLL:
+  {
+    // Leftward marquee: penX0 = (x + w) − scrolledPx; when scrolledPx exceeds
+    // w + textWidth + 1 the cycle restarts (scrolledPx mod (w + textWidth + 1)).
+    uint32_t cycle = (uint32_t)acmdScW + (uint32_t)acmdScTextW + 1;
+    uint32_t scrolledPx = (elapsed / acmdScSpeedMs) % cycle;
+    int32_t penX = (int32_t)acmdScX + (int32_t)acmdScW - (int32_t)scrolledPx;
+    const AcmdFontPage &pg = acmdFonts[acmdScFontId];
+    for (uint8_t i = 0; i < acmdScLen; i++)
+    {
+      uint16_t off = pg.codeOff[(uint8_t)acmdScText[i]];
+      if (off != ACMD_GLYPH_ABSENT)
+      {
+        acmdDrawGlyph(acmdWork, pg.glyphs + off, penX, acmdScY, acmdScColor,
+                      true, acmdScX, acmdScY, acmdScW, acmdScH);
+        penX += (int8_t)pg.glyphs[off + 3];
+      }
+      else
+        penX += 4;
+    }
+    break;
+  }
+  case ACMD_PARAM_BLINK:
+  {
+    // Alternate content ↔ black every periodMs/2; the first half shows content
+    // (content = the base copy already in acmdWork).
+    if ((elapsed % acmdBlPeriodMs) >= acmdBlPeriodMs / 2)
+      for (int16_t py = acmdBlY; py < acmdBlY + acmdBlH; py++)
+        for (int16_t px = acmdBlX; px < acmdBlX + acmdBlW; px++)
+          acmdPixel(acmdWork, px, py, 0);
+    break;
+  }
+  default:
+    break;
+  }
+  dma_display->drawRGBBitmap(0, 0, acmdWork, W, H);
+}
+
 void callback(char *topic, byte *payload, unsigned int length)
 {
   if (!updateScreen)
@@ -1235,6 +1903,11 @@ void callback(char *topic, byte *payload, unsigned int length)
     if (strcmp(suffix, TOPIC_ANIM_PLAY) == 0)
     {
       handleAnimPlay(payload, length);
+      return;
+    }
+    if (strcmp(suffix, TOPIC_CMD) == 0)
+    {
+      handleAcmd(payload, length);
       return;
     }
   }
@@ -1407,12 +2080,15 @@ void reconnect()
       char animStartTopic[48];
       char animFrameTopic[48];
       char animPlayTopic[48];
+      char cmdTopic[48];
       snprintf(animStartTopic, sizeof(animStartTopic), "%s%s", getClientId(), TOPIC_ANIM_START);
       snprintf(animFrameTopic, sizeof(animFrameTopic), "%s%s", getClientId(), TOPIC_ANIM_FRAME);
       snprintf(animPlayTopic, sizeof(animPlayTopic), "%s%s", getClientId(), TOPIC_ANIM_PLAY);
+      snprintf(cmdTopic, sizeof(cmdTopic), "%s%s", getClientId(), TOPIC_CMD);
       Serial.printf("Subscribed to %s: %s\n", animStartTopic, client.subscribe(animStartTopic) ? "ok" : "FAILED");
       Serial.printf("Subscribed to %s: %s\n", animFrameTopic, client.subscribe(animFrameTopic) ? "ok" : "FAILED");
       Serial.printf("Subscribed to %s: %s\n", animPlayTopic, client.subscribe(animPlayTopic) ? "ok" : "FAILED");
+      Serial.printf("Subscribed to %s: %s\n", cmdTopic, client.subscribe(cmdTopic) ? "ok" : "FAILED"); // QoS 0
       if (animUploading)
         abortAnimUpload(); // an in-flight upload died with the connection; completed staging survives
       startAnimation(animPlayingSlot); // slot files persist across reconnects
@@ -1562,6 +2238,7 @@ void loop()
     }
 
     animationTick();
+    acmdTick(); // parametric overlay (SWEEP/SCROLL/BLINK); no-op unless ACMD is active
   }
   else
   {
