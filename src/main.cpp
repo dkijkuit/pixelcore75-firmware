@@ -115,9 +115,16 @@ static constexpr const char *TOPIC_ANIM_PLAY = "/anim/play";
 static constexpr const char *TOPIC_ANIM_LOADED = "/anim/loaded";
 static constexpr const char *ANIM_UPLOAD_PATH = "/anim_up.bin"; // staging file while an upload is in flight
 static constexpr uint8_t ANIM_MAX_SLOTS = 32; // persistent animation slots; capacity-bound, eviction self-heals via re-upload
-static constexpr size_t ANIM_FILE_HEADER_BYTES = 4; // frameCount(u16) + delayMs(u16)
+static constexpr size_t ANIM_FILE_HEADER_BYTES = 4; // v1 slot file: frameCount(u16) + delayMs(u16)
 static constexpr size_t ANIM_START_PAYLOAD = 14;    // magic + frameCount + delayMs + uploadId + flags + slot
-static constexpr size_t ANIM_FRAME_PAYLOAD = 6 + FRAME_BYTES; // magic + frameIdx + pixels
+static constexpr size_t ANIM_FRAME_PAYLOAD = 6 + FRAME_BYTES; // v1 ANIF: magic + frameIdx + pixels
+static constexpr size_t ANIM_FRAME_V2_MIN = 103;    // v2 ANIF floor: header + palette + one run per row (32 rows)
+static constexpr size_t ANIM_FRAME_V2_MAX = 4103;   // v2 ANIF ceiling: header + 4096B RAW body
+static constexpr size_t ANIM_FRAME_V2_HEADER_BYTES = 7; // v2 ANIF: magic + frameIdx + frameFlags
+static constexpr uint16_t SLOT_FILE_V2_MAGIC = 0x3241;  // "A2" (bytes 0x41 0x32); v1 would read it as
+                                                        // frameCount 12865 > 200, so the formats can't collide
+static constexpr size_t SLOT_FILE_V2_HEADER_BYTES = 6;  // v2 slot file: magic(u16) + frameCount(u16) + delayMs(u16)
+static constexpr size_t PAL_RLE_PALETTE_BYTES = 32;     // 16 entries x RGB565 LE
 static constexpr size_t ANIM_PLAY_PAYLOAD = 9;      // magic + slot + uploadId
 static constexpr size_t ANIM_LOADED_PAYLOAD = 9;    // magic + slot + uploadId
 static constexpr uint32_t SLOTIDX_MAGIC = 0x49544C53;       // "SLTI" little-endian
@@ -125,9 +132,12 @@ static constexpr const char *SLOTIDX_PATH = "/slotidx.bin"; // per-slot uploadId
 static constexpr uint8_t SLOTIDX_VERSION = 1;
 static constexpr size_t SLOTIDX_FILE_BYTES = 5 + ANIM_MAX_SLOTS * 4; // magic + version + one u32 uploadId per slot
 static constexpr uint8_t ANIM_FLAG_STAGE_ONLY = 0x01; // stage to flash but wait for /anim/play
+static constexpr uint8_t ANIM_FLAG_CODEC_MASK = 0x06; // bits 1-2 = upload codec
+static constexpr uint8_t ANIM_FLAG_CODEC_PAL_RLE = 0x02; // codec 1: per-frame RAW/PAL_RLE, v2 slot file
 static constexpr uint16_t MAX_ANIM_FRAMES = 200;    // sanity cap; ~800KB fits the ~4.9MB LittleFS many times over
 static constexpr uint16_t ANIM_MIN_DELAY_MS = 10;
-static constexpr size_t ANIM_RING_FRAMES = 8;  // RAM frame ring (8*4KB): decouples MQTT from flash writes
+static constexpr size_t ANIM_RING_FRAMES = 8;  // RAM frame ring (8 slots): decouples MQTT from flash writes
+static constexpr size_t ANIM_RING_SLOT_BYTES = 4104; // worst-case buffered blob: v2 frameFlags + 4096B body
 static constexpr size_t ANIM_FLUSH_CHUNK = 256; // one flash page per loop pass while an animation plays
 
 uint8_t rxBuf[FRAME_BYTES];       // raw bytes from MQTT
@@ -135,6 +145,8 @@ uint16_t *px = (uint16_t *)rxBuf; // view as RGB565 pixels (little-endian)
 
 bool animActive = false;
 bool animUploading = false;
+bool animUploadV2 = false;   // current upload uses codec 1 (per-frame blobs, v2 slot file)
+bool animPlayingV2 = false;  // playing slot is v2 format (offset table + blobs); v1 = fixed-size frames
 bool animLoadedAckPending = false;
 uint32_t animUploadId = 0;
 bool animStageOnly = false;     // current upload stages but doesn't play on completion
@@ -144,6 +156,11 @@ uint8_t animAckSlot = 0;        // ack payload while animLoadedAckPending
 uint32_t animAckUploadId = 0;   // ack payload while animLoadedAckPending
 uint32_t animPlayRequestId = 0; // /anim/play that arrived while the upload was still running
 uint32_t animSlotUploadIds[ANIM_MAX_SLOTS] = {0}; // RAM mirror of /slotidx.bin; 0 = slot content unknown
+uint32_t animUploadBlobBytes = 0;               // v2 upload: blob bytes accepted so far (ring + flushed)
+uint32_t animFrameOffsets[MAX_ANIM_FRAMES];     // v2 upload: absolute blob offsets in the staging file
+uint32_t animPlayOffsets[MAX_ANIM_FRAMES];      // v2 playback: absolute blob offsets in the slot file
+uint32_t animPlayFileSize = 0;                  // v2 playback: bounds blob reads (last blob runs to EOF)
+uint8_t animV2Scratch[ANIM_FRAME_V2_MAX - ANIM_FRAME_V2_HEADER_BYTES - PAL_RLE_PALETTE_BYTES]; // PAL_RLE pairs (4064 B)
 uint16_t animUploadCount = 0;
 uint16_t animExpectedIdx = 0;
 uint16_t animFrameCount = 0;
@@ -159,7 +176,10 @@ File animUploadFile; // staging file, held open for the whole upload (per-frame 
 // block erases tens of ms), so doing them inline in the callback froze the animation
 // tick for the whole 4KB frame. Backpressure: loop() stops calling client.loop() when
 // the ring is nearly full, so TCP/MQTT flow control throttles the server instead.
-uint8_t animRing[ANIM_RING_FRAMES][FRAME_BYTES];
+// Slots hold one frame blob each: FRAME_BYTES for v1 uploads, frameFlags+body (1..4097 B)
+// for v2 — animRingLen tracks the valid length of each slot.
+uint8_t animRing[ANIM_RING_FRAMES][ANIM_RING_SLOT_BYTES];
+size_t animRingLen[ANIM_RING_FRAMES]; // valid bytes per slot (set when the frame is queued)
 size_t animRingHead = 0;       // next free frame (writer: MQTT callback)
 size_t animRingTail = 0;       // oldest buffered frame (reader: loop flusher)
 size_t animRingCount = 0;      // frames buffered
@@ -559,6 +579,7 @@ void setAsciiValue(BLECharacteristic *ch, const String &val)
 void abortAnimUpload()
 {
   animUploading = false;
+  animUploadV2 = false;
   animStageOnly = false;
   animPlayRequestId = 0;
   animRingHead = animRingTail = animRingCount = 0;
@@ -659,6 +680,7 @@ void stopAnimation(bool removePlayingSlot)
 {
   bool wasUploading = animUploading;
   animActive = false;
+  animPlayingV2 = false;
   animUploading = false;
   animLoadedAckPending = false;
   if (animFile)
@@ -681,11 +703,85 @@ void animationTick()
   if (millis() - animLastFrameMs >= animDelayMs)
     animLastFrameMs = millis(); // fell a full frame or more behind: resync, don't fast-forward
 
-  size_t offset = ANIM_FILE_HEADER_BYTES + (size_t)animFrameIdx * FRAME_BYTES;
-  if (!animFile.seek(offset) || animFile.read(animBuf, FRAME_BYTES) != FRAME_BYTES)
+  if (animPlayingV2)
   {
-    stopAnimation(true);
-    return;
+    // v2 slot file: seek this frame's blob, dispatch on its per-frame flag. Ingest already
+    // validated the structure; any read/decode failure here means flash corruption → the
+    // v1 remedy (stop + delete) applies to both formats.
+    uint32_t blob = animPlayOffsets[animFrameIdx];
+    if (!animFile.seek(blob))
+    {
+      stopAnimation(true);
+      return;
+    }
+    uint8_t frameFlags = 0;
+    if (animFile.read(&frameFlags, 1) != 1)
+    {
+      stopAnimation(true);
+      return;
+    }
+    if (frameFlags == 0)
+    {
+      if (animFile.read(animBuf, FRAME_BYTES) != FRAME_BYTES)
+      {
+        stopAnimation(true);
+        return;
+      }
+    }
+    else if (frameFlags == 1)
+    {
+      uint8_t pal[PAL_RLE_PALETTE_BYTES];
+      if (animFile.read(pal, sizeof(pal)) != sizeof(pal))
+      {
+        stopAnimation(true);
+        return;
+      }
+      uint16_t pal16[16];
+      for (uint8_t c = 0; c < 16; c++)
+        pal16[c] = (uint16_t)pal[2 * c] | ((uint16_t)pal[2 * c + 1] << 8);
+      // The last blob runs to EOF; cap the pair read at the scratch size (a valid frame
+      // never needs more, since ingest enforced the 4103-byte ANIF ceiling).
+      uint32_t remain = animPlayFileSize - blob - 1 - sizeof(pal);
+      size_t rd = remain < sizeof(animV2Scratch) ? remain : sizeof(animV2Scratch);
+      if (animFile.read(animV2Scratch, rd) != rd)
+      {
+        stopAnimation(true);
+        return;
+      }
+      uint16_t *out = (uint16_t *)animBuf;
+      size_t done = 0;
+      for (size_t p = 0; p < rd / 2; p++)
+      {
+        uint8_t run = animV2Scratch[2 * p];
+        uint8_t ci = animV2Scratch[2 * p + 1];
+        if (run < 1 || ci > 15 || done + run > W * H)
+        {
+          stopAnimation(true); // corrupt pair: never index past the palette or buffer
+          return;
+        }
+        for (uint8_t r = 0; r < run; r++)
+          out[done++] = pal16[ci];
+      }
+      if (done != W * H)
+      {
+        stopAnimation(true);
+        return;
+      }
+    }
+    else
+    {
+      stopAnimation(true); // unknown per-frame flag: corrupt blob
+      return;
+    }
+  }
+  else
+  {
+    size_t offset = ANIM_FILE_HEADER_BYTES + (size_t)animFrameIdx * FRAME_BYTES;
+    if (!animFile.seek(offset) || animFile.read(animBuf, FRAME_BYTES) != FRAME_BYTES)
+    {
+      stopAnimation(true);
+      return;
+    }
   }
 
   dma_display->drawRGBBitmap(0, 0, (uint16_t *)animBuf, W, H);
@@ -707,16 +803,57 @@ void startAnimation(uint8_t slot)
   if (!f)
     return;
 
-  uint8_t hdr[ANIM_FILE_HEADER_BYTES];
-  bool valid = f.size() >= ANIM_FILE_HEADER_BYTES + FRAME_BYTES &&
-               f.seek(0) &&
-               f.read(hdr, ANIM_FILE_HEADER_BYTES) == ANIM_FILE_HEADER_BYTES;
+  // Format sniff on the first two bytes: "A2" = v2 (offset table + per-frame blobs),
+  // anything else = v1 (fixed-size frames). Unambiguous: read as a v1 frameCount, the
+  // magic is 12865 > MAX_ANIM_FRAMES, so no v1 file can start with it.
+  uint8_t hdr[SLOT_FILE_V2_HEADER_BYTES];
+  bool valid = f.size() >= 2 && f.seek(0) && f.read(hdr, 2) == 2;
+  bool v2 = valid && hdr[0] == (uint8_t)(SLOT_FILE_V2_MAGIC & 0xFF) &&
+            hdr[1] == (uint8_t)(SLOT_FILE_V2_MAGIC >> 8);
   if (valid)
   {
-    animFrameCount = hdr[0] | (hdr[1] << 8);
-    animDelayMs = hdr[2] | (hdr[3] << 8);
-    valid = animFrameCount >= 2 && animFrameCount <= MAX_ANIM_FRAMES &&
-            f.size() == ANIM_FILE_HEADER_BYTES + (size_t)animFrameCount * FRAME_BYTES;
+    if (v2)
+    {
+      valid = f.size() >= SLOT_FILE_V2_HEADER_BYTES && f.seek(0) &&
+              f.read(hdr, SLOT_FILE_V2_HEADER_BYTES) == SLOT_FILE_V2_HEADER_BYTES;
+      if (valid)
+      {
+        animFrameCount = hdr[2] | (hdr[3] << 8);
+        animDelayMs = hdr[4] | (hdr[5] << 8);
+        size_t tableEnd = SLOT_FILE_V2_HEADER_BYTES + (size_t)animFrameCount * 4;
+        // Offset table must be readable, start at/after its own end, be monotonic
+        // non-decreasing and point every blob inside the file (so the last blob ends
+        // at/before EOF — it runs to EOF during playback).
+        valid = animFrameCount >= 2 && animFrameCount <= MAX_ANIM_FRAMES &&
+                f.size() > tableEnd && f.seek(SLOT_FILE_V2_HEADER_BYTES);
+        uint32_t prev = (uint32_t)tableEnd;
+        for (uint16_t i = 0; valid && i < animFrameCount; i++)
+        {
+          uint8_t e[4];
+          valid = f.read(e, 4) == 4;
+          uint32_t off = 0;
+          if (valid)
+            off = (uint32_t)e[0] | ((uint32_t)e[1] << 8) | ((uint32_t)e[2] << 16) | ((uint32_t)e[3] << 24);
+          valid = valid && off >= prev && off < f.size();
+          prev = off;
+          if (valid)
+            animPlayOffsets[i] = off;
+        }
+        animPlayFileSize = f.size();
+      }
+    }
+    else
+    {
+      valid = f.size() >= ANIM_FILE_HEADER_BYTES + FRAME_BYTES && f.seek(0) &&
+              f.read(hdr, ANIM_FILE_HEADER_BYTES) == ANIM_FILE_HEADER_BYTES;
+      if (valid)
+      {
+        animFrameCount = hdr[0] | (hdr[1] << 8);
+        animDelayMs = hdr[2] | (hdr[3] << 8);
+        valid = animFrameCount >= 2 && animFrameCount <= MAX_ANIM_FRAMES &&
+                f.size() == ANIM_FILE_HEADER_BYTES + (size_t)animFrameCount * FRAME_BYTES;
+      }
+    }
   }
   if (!valid)
   {
@@ -729,6 +866,7 @@ void startAnimation(uint8_t slot)
   if (animDelayMs < ANIM_MIN_DELAY_MS)
     animDelayMs = ANIM_MIN_DELAY_MS;
 
+  animPlayingV2 = v2;
   animPlayingSlot = slot;
   animFile = f;
   animFrameIdx = 0;
@@ -752,6 +890,10 @@ void handleAnimStart(const byte *payload, unsigned int length)
   uint32_t uploadId = (uint32_t)payload[8] | ((uint32_t)payload[9] << 8) |
                       ((uint32_t)payload[10] << 16) | ((uint32_t)payload[11] << 24);
   bool stageOnly = (payload[12] & ANIM_FLAG_STAGE_ONLY) != 0;
+  uint8_t codecBits = payload[12] & ANIM_FLAG_CODEC_MASK;
+  if (codecBits != 0 && codecBits != ANIM_FLAG_CODEC_PAL_RLE)
+    return; // unknown codec (2-3): silent drop, the server times out and downgrades to RAW
+  bool v2 = codecBits == ANIM_FLAG_CODEC_PAL_RLE;
   uint8_t slot = payload[13];
   if (slot >= ANIM_MAX_SLOTS)
     return;
@@ -771,6 +913,8 @@ void handleAnimStart(const byte *payload, unsigned int length)
   // Space ladder for the staging file: drop the slot file being replaced first, then idle
   // slot files, and only as a last resort the playing animation. Every dropped file also
   // invalidates its slotidx entry so the index never outlives the content it describes.
+  // The estimate is the v1 worst case (4 + count*4096); v2 uploads land smaller, so it
+  // stays a safe upper bound.
   size_t needed = ANIM_FILE_HEADER_BYTES + (size_t)count * FRAME_BYTES;
   auto freeOk = [&]() { return LittleFS.totalBytes() - LittleFS.usedBytes() >= needed; };
   bool idxDirty = false;
@@ -800,10 +944,40 @@ void handleAnimStart(const byte *payload, unsigned int length)
   if (!f)
     return;
 
-  uint8_t hdr[ANIM_FILE_HEADER_BYTES] = {
-      (uint8_t)(count & 0xFF), (uint8_t)(count >> 8),
-      (uint8_t)(delayMs & 0xFF), (uint8_t)(delayMs >> 8)};
-  bool ok = f.write(hdr, ANIM_FILE_HEADER_BYTES) == ANIM_FILE_HEADER_BYTES;
+  // v1 staging: 4-byte header + raw frames. v2 staging: 6-byte header + a zeroed
+  // placeholder offset table (patched with the real blob offsets on completion).
+  uint8_t hdr[SLOT_FILE_V2_HEADER_BYTES];
+  size_t hdrLen;
+  if (v2)
+  {
+    hdr[0] = (uint8_t)(SLOT_FILE_V2_MAGIC & 0xFF);
+    hdr[1] = (uint8_t)(SLOT_FILE_V2_MAGIC >> 8);
+    hdr[2] = (uint8_t)(count & 0xFF);
+    hdr[3] = (uint8_t)(count >> 8);
+    hdr[4] = (uint8_t)(delayMs & 0xFF);
+    hdr[5] = (uint8_t)(delayMs >> 8);
+    hdrLen = SLOT_FILE_V2_HEADER_BYTES;
+  }
+  else
+  {
+    hdr[0] = (uint8_t)(count & 0xFF);
+    hdr[1] = (uint8_t)(count >> 8);
+    hdr[2] = (uint8_t)(delayMs & 0xFF);
+    hdr[3] = (uint8_t)(delayMs >> 8);
+    hdrLen = ANIM_FILE_HEADER_BYTES;
+  }
+  bool ok = f.write(hdr, hdrLen) == hdrLen;
+  if (ok && v2)
+  {
+    static const uint8_t zeros[64] = {0};
+    size_t tableBytes = (size_t)count * 4;
+    while (ok && tableBytes > 0)
+    {
+      size_t chunk = tableBytes < sizeof(zeros) ? tableBytes : sizeof(zeros);
+      ok = f.write(zeros, chunk) == chunk;
+      tableBytes -= chunk;
+    }
+  }
   if (!ok)
   {
     f.close();
@@ -812,20 +986,58 @@ void handleAnimStart(const byte *payload, unsigned int length)
   }
   animUploadFile = f; // kept open until the upload completes or aborts
 
-  Serial.printf("Animation upload started: slot %u, %u frames, %u ms delay%s\n",
-                slot, count, delayMs, stageOnly ? " (stage-only)" : "");
+  Serial.printf("Animation upload started: slot %u, %u frames, %u ms delay%s%s\n",
+                slot, count, delayMs, v2 ? " (PAL_RLE)" : "", stageOnly ? " (stage-only)" : "");
 
   animUploadId = uploadId;
   animStageOnly = stageOnly;
   animSlot = slot;
   animUploadCount = count;
   animExpectedIdx = 0;
+  animUploadV2 = v2;
+  animUploadBlobBytes = 0;
   animUploading = true;
+}
+
+/** Structural ingest check for a PAL_RLE ANIF body: 32-byte palette + (run, colorIdx)
+ *  pairs. Runs never cross row boundaries: 64 px per row, each row's runs sum to exactly
+ *  64, run is 1..64, colorIdx is 0..15, and the pairs cover all 2048 pixels. Violations
+ *  abort the upload so garbage never reaches flash. */
+static bool palRleBodyValid(const uint8_t *body, size_t len)
+{
+  if (len < PAL_RLE_PALETTE_BYTES || (len - PAL_RLE_PALETTE_BYTES) % 2 != 0)
+    return false;
+  const uint8_t *pairs = body + PAL_RLE_PALETTE_BYTES;
+  size_t pairCount = (len - PAL_RLE_PALETTE_BYTES) / 2;
+  size_t total = 0, row = 0;
+  for (size_t i = 0; i < pairCount; i++)
+  {
+    uint8_t run = pairs[2 * i];
+    if (run < 1 || run > W || pairs[2 * i + 1] > 15)
+      return false;
+    row += run;
+    total += run;
+    if (row > W)
+      return false; // this run crossed (or overshot) the row boundary
+    if (row == W)
+      row = 0;
+  }
+  return row == 0 && total == W * H;
 }
 
 void handleAnimFrame(const byte *payload, unsigned int length)
 {
-  if (!animUploading || length != ANIM_FRAME_PAYLOAD)
+  if (!animUploading)
+    return;
+  if (animUploadV2)
+  {
+    if (length < ANIM_FRAME_V2_MIN || length > ANIM_FRAME_V2_MAX)
+    {
+      abortAnimUpload(); // v2 frames are structurally checked at ingest
+      return;
+    }
+  }
+  else if (length != ANIM_FRAME_PAYLOAD)
     return;
 
   uint32_t magic;
@@ -837,6 +1049,19 @@ void handleAnimFrame(const byte *payload, unsigned int length)
   if (idx != animExpectedIdx)
     return;
 
+  size_t blobLen = length - 6; // frameFlags + body for v2, raw pixels for v1
+  if (animUploadV2)
+  {
+    if (idx >= animUploadCount)
+      return; // over-sent frame: the ANIM frameCount is authoritative
+    uint8_t frameFlags = payload[6];
+    if (frameFlags > 1 || (frameFlags == 1 && !palRleBodyValid(payload + 7, length - 7)))
+    {
+      abortAnimUpload();
+      return;
+    }
+  }
+
   // Ring only; the flash write happens in loop() (animUploadFlush). Flow control
   // (gated client.loop()) keeps a slot free, a full ring here means it failed.
   if (animRingCount >= ANIM_RING_FRAMES)
@@ -845,7 +1070,15 @@ void handleAnimFrame(const byte *payload, unsigned int length)
     return;
   }
 
-  memcpy(animRing[animRingHead], payload + 6, FRAME_BYTES);
+  memcpy(animRing[animRingHead], payload + 6, blobLen);
+  animRingLen[animRingHead] = blobLen;
+  if (animUploadV2)
+  {
+    // Blob offsets are deterministic in acceptance order, independent of flush timing:
+    // header + placeholder table + every previously accepted blob.
+    animFrameOffsets[idx] = SLOT_FILE_V2_HEADER_BYTES + (uint32_t)animUploadCount * 4 + animUploadBlobBytes;
+    animUploadBlobBytes += blobLen;
+  }
   animRingHead = (animRingHead + 1) % ANIM_RING_FRAMES;
   animRingCount++;
   animExpectedIdx++;
@@ -859,10 +1092,11 @@ void animUploadFlush()
   if (!animUploading)
     return;
 
-  size_t budget = animActive ? ANIM_FLUSH_CHUNK : FRAME_BYTES;
+  size_t budget = animActive ? ANIM_FLUSH_CHUNK : ANIM_RING_SLOT_BYTES;
   while (animRingCount > 0 && budget > 0)
   {
-    size_t chunk = FRAME_BYTES - animRingFlushed;
+    size_t slotLen = animRingLen[animRingTail];
+    size_t chunk = slotLen - animRingFlushed;
     if (chunk > budget)
       chunk = budget;
     if (!animUploadFile || animUploadFile.write(animRing[animRingTail] + animRingFlushed, chunk) != chunk)
@@ -873,7 +1107,7 @@ void animUploadFlush()
     }
     animRingFlushed += chunk;
     budget -= chunk;
-    if (animRingFlushed >= FRAME_BYTES)
+    if (animRingFlushed >= slotLen)
     {
       animRingFlushed = 0;
       animRingTail = (animRingTail + 1) % ANIM_RING_FRAMES;
@@ -890,6 +1124,27 @@ void completeAnimUpload()
 {
   Serial.println("Animation upload complete");
   animUploading = false; // before stopAnimation, so staging is preserved
+  if (animUploadV2)
+  {
+    animUploadV2 = false;
+    // Patch the placeholder offset table now that every blob has landed, while the
+    // staging handle is still open. A failed patch leaves an unplayable file — drop
+    // the whole upload instead; the server re-sends on its ack timeout.
+    bool ok = animUploadFile.seek(SLOT_FILE_V2_HEADER_BYTES);
+    for (uint16_t i = 0; ok && i < animUploadCount; i++)
+    {
+      uint32_t off = animFrameOffsets[i];
+      uint8_t e[4] = {(uint8_t)(off & 0xFF), (uint8_t)(off >> 8),
+                      (uint8_t)(off >> 16), (uint8_t)(off >> 24)};
+      ok = animUploadFile.write(e, sizeof(e)) == sizeof(e);
+    }
+    if (!ok)
+    {
+      animUploadFile.close();
+      LittleFS.remove(ANIM_UPLOAD_PATH);
+      return;
+    }
+  }
   animUploadFile.close();
 
   // Replacing the slot the animation is currently playing from: stop playback first,
