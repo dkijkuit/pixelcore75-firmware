@@ -120,6 +120,10 @@ static constexpr size_t ANIM_START_PAYLOAD = 14;    // magic + frameCount + dela
 static constexpr size_t ANIM_FRAME_PAYLOAD = 6 + FRAME_BYTES; // magic + frameIdx + pixels
 static constexpr size_t ANIM_PLAY_PAYLOAD = 9;      // magic + slot + uploadId
 static constexpr size_t ANIM_LOADED_PAYLOAD = 9;    // magic + slot + uploadId
+static constexpr uint32_t SLOTIDX_MAGIC = 0x49544C53;       // "SLTI" little-endian
+static constexpr const char *SLOTIDX_PATH = "/slotidx.bin"; // per-slot uploadId index: content-hash cache for /anim/play
+static constexpr uint8_t SLOTIDX_VERSION = 1;
+static constexpr size_t SLOTIDX_FILE_BYTES = 5 + ANIM_MAX_SLOTS * 4; // magic + version + one u32 uploadId per slot
 static constexpr uint8_t ANIM_FLAG_STAGE_ONLY = 0x01; // stage to flash but wait for /anim/play
 static constexpr uint16_t MAX_ANIM_FRAMES = 200;    // sanity cap; ~800KB fits the ~4.9MB LittleFS many times over
 static constexpr uint16_t ANIM_MIN_DELAY_MS = 10;
@@ -139,6 +143,7 @@ uint8_t animPlayingSlot = 0;    // slot currently playing (auto-resume after rec
 uint8_t animAckSlot = 0;        // ack payload while animLoadedAckPending
 uint32_t animAckUploadId = 0;   // ack payload while animLoadedAckPending
 uint32_t animPlayRequestId = 0; // /anim/play that arrived while the upload was still running
+uint32_t animSlotUploadIds[ANIM_MAX_SLOTS] = {0}; // RAM mirror of /slotidx.bin; 0 = slot content unknown
 uint16_t animUploadCount = 0;
 uint16_t animExpectedIdx = 0;
 uint16_t animFrameCount = 0;
@@ -572,6 +577,69 @@ static const char *animSlotPath(uint8_t slot)
   return buf;
 }
 
+/** Load the slot upload-id index. Anything missing or invalid (bad magic/version/size)
+ *  leaves all zeros, which merely disables the ANIP hash-skip until the next completed
+ *  upload rewrites the file — a reflash or corrupt index costs one redundant upload. */
+static void loadSlotUploadIds()
+{
+  memset(animSlotUploadIds, 0, sizeof(animSlotUploadIds));
+  if (!LittleFS.exists(SLOTIDX_PATH))
+    return;
+  File f = LittleFS.open(SLOTIDX_PATH, FILE_READ);
+  if (!f)
+    return;
+  uint8_t ids[SLOTIDX_FILE_BYTES];
+  bool valid = f.size() == SLOTIDX_FILE_BYTES &&
+               f.seek(0) &&
+               f.read(ids, sizeof(ids)) == sizeof(ids);
+  f.close();
+  uint32_t magic = 0;
+  if (valid)
+    memcpy(&magic, ids, sizeof(magic));
+  if (!valid || magic != SLOTIDX_MAGIC || ids[4] != SLOTIDX_VERSION)
+    return;
+  for (uint8_t s = 0; s < ANIM_MAX_SLOTS; s++)
+  {
+    size_t o = 5 + (size_t)s * 4;
+    animSlotUploadIds[s] = (uint32_t)ids[o] | ((uint32_t)ids[o + 1] << 8) |
+                           ((uint32_t)ids[o + 2] << 16) | ((uint32_t)ids[o + 3] << 24);
+  }
+}
+
+/** Persist the slot upload-id index. Full-file rewrite (133 bytes) — entries only change
+ *  on upload completion, ladder eviction or corrupt-file deletion, all rare events. */
+static void saveSlotUploadIds()
+{
+  uint8_t ids[SLOTIDX_FILE_BYTES] = {'S', 'L', 'T', 'I', SLOTIDX_VERSION};
+  for (uint8_t s = 0; s < ANIM_MAX_SLOTS; s++)
+  {
+    uint32_t id = animSlotUploadIds[s];
+    size_t o = 5 + (size_t)s * 4;
+    ids[o] = (uint8_t)(id & 0xFF);
+    ids[o + 1] = (uint8_t)(id >> 8);
+    ids[o + 2] = (uint8_t)(id >> 16);
+    ids[o + 3] = (uint8_t)(id >> 24);
+  }
+  File f = LittleFS.open(SLOTIDX_PATH, FILE_WRITE);
+  if (!f)
+    return;
+  if (f.write(ids, sizeof(ids)) != sizeof(ids))
+  {
+    f.close();
+    LittleFS.remove(SLOTIDX_PATH); // truncated index: load treats it as all zeros anyway
+    return;
+  }
+  f.close();
+}
+
+static void setSlotUploadId(uint8_t slot, uint32_t uploadId)
+{
+  if (slot >= ANIM_MAX_SLOTS || animSlotUploadIds[slot] == uploadId)
+    return;
+  animSlotUploadIds[slot] = uploadId;
+  saveSlotUploadIds();
+}
+
 void playSlot(uint8_t slot, uint32_t uploadId)
 {
   if (slot >= ANIM_MAX_SLOTS)
@@ -654,6 +722,7 @@ void startAnimation(uint8_t slot)
   {
     f.close();
     LittleFS.remove(path);
+    setSlotUploadId(slot, 0); // index must not claim content for a deleted file
     return;
   }
 
@@ -700,18 +769,30 @@ void handleAnimStart(const byte *payload, unsigned int length)
   LittleFS.remove(ANIM_UPLOAD_PATH); // stale partial upload from an earlier attempt
 
   // Space ladder for the staging file: drop the slot file being replaced first, then idle
-  // slot files, and only as a last resort the playing animation.
+  // slot files, and only as a last resort the playing animation. Every dropped file also
+  // invalidates its slotidx entry so the index never outlives the content it describes.
   size_t needed = ANIM_FILE_HEADER_BYTES + (size_t)count * FRAME_BYTES;
   auto freeOk = [&]() { return LittleFS.totalBytes() - LittleFS.usedBytes() >= needed; };
-  LittleFS.remove(animSlotPath(slot));
+  bool idxDirty = false;
+  auto dropSlot = [&](uint8_t s) {
+    LittleFS.remove(animSlotPath(s));
+    if (animSlotUploadIds[s] != 0)
+    {
+      animSlotUploadIds[s] = 0;
+      idxDirty = true;
+    }
+  };
+  dropSlot(slot);
   if (!freeOk())
     for (uint8_t s = 0; s < ANIM_MAX_SLOTS && !freeOk(); s++)
       if (s != slot && !(animActive && s == animPlayingSlot))
-        LittleFS.remove(animSlotPath(s));
+        dropSlot(s);
   if (!freeOk() && animActive)
     stopAnimation(false); // sacrifice the playing animation, keep its file for last
   if (!freeOk())
-    LittleFS.remove(animSlotPath(animPlayingSlot));
+    dropSlot(animPlayingSlot);
+  if (idxDirty)
+    saveSlotUploadIds();
   if (!freeOk())
     return;
 
@@ -822,6 +903,7 @@ void completeAnimUpload()
     Serial.println("Animation rename failed");
     return;
   }
+  setSlotUploadId(animSlot, animUploadId); // slot content now matches this upload's hash
 
   // Ack the staging completion so the server knows the content landed.
   if (animStageOnly)
@@ -861,8 +943,14 @@ void handleAnimPlay(const byte *payload, unsigned int length)
     return;
   }
 
-  // Play whatever the slot holds: the server only skips the upload when the slot's
-  // content is unchanged (persistent cache), so no id match is needed here.
+  // Content-hash gate: a non-zero uploadId means the server skipped the upload because
+  // it believes this slot already holds that content. Play only on an exact persisted-id
+  // match; on mismatch stay silent (no play, no ANIL) so the server's play-ack timeout
+  // falls back to an inline upload. A missing/corrupt slot file is also silent:
+  // startAnimation fails and never arms the ANIL. uploadId 0 keeps legacy behavior.
+  if (uploadId != 0 && animSlotUploadIds[slot] != uploadId)
+    return;
+
   playSlot(slot, uploadId);
 }
 
@@ -1127,6 +1215,7 @@ void setup()
 
   LittleFS.remove(ANIM_UPLOAD_PATH); // any staging file is stale after a reboot
   LittleFS.remove("/anim.bin");      // legacy pre-slot animation file, reclaim its space
+  loadSlotUploadIds();               // slot content-hash index; invalid/missing file loads zeros (safe)
   Serial.printf("LittleFS: %u / %u bytes used\n",
                 (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes());
 
