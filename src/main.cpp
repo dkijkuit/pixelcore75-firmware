@@ -1777,6 +1777,15 @@ void handleAcmd(const byte *payload, unsigned int length)
 
   // Commit: swap work into base, stop animation playback (slot files kept), arm the
   // winning parametric, push the frame. Everything after this point is live state.
+  // SWEEP phase carry-over: a batch whose winning parametric is a SWEEP identical to
+  // the live one (cx/cy/r/color/speed) keeps the parametric epoch — the phase runs
+  // continuously across refresh republishes, so QoS-0 arrival jitter cannot snap the
+  // line back to 0°. Any param change, another parametric type, or no live overlay
+  // (stopAnimation below clears acmdActive) arms fresh. Decided BEFORE stopAnimation.
+  const bool carrySweepEpoch = acmdActive && acmdParam == ACMD_PARAM_SWEEP &&
+                               candParam == ACMD_PARAM_SWEEP && acmdSwCx == cSwCx &&
+                               acmdSwCy == cSwCy && acmdSwR == cSwR &&
+                               acmdSwColor == cSwColor && acmdSwSpeed == cSwSpeed;
   memcpy(acmdBase, acmdWork, sizeof(acmdBase));
   stopAnimation(false);
   acmdParam = candParam;
@@ -1800,8 +1809,8 @@ void handleAcmd(const byte *payload, unsigned int length)
   acmdBlW = cBlW;
   acmdBlH = cBlH;
   acmdBlPeriodMs = cBlPeriodMs;
-  acmdCommitMs = millis();
-  acmdLastDrawMs = acmdCommitMs;
+  acmdCommitMs = carrySweepEpoch ? acmdCommitMs : millis(); // carry: keep the epoch
+  acmdLastDrawMs = acmdCommitMs; // carried epoch is old → next tick fires immediately
   acmdActive = true;
   currentScreenImage = ScreenImage::Client;
   dma_display->drawRGBBitmap(0, 0, acmdWork, W, H);
