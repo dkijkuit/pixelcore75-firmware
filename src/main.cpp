@@ -136,6 +136,8 @@ static constexpr size_t ACMD_HEADER_BYTES = 7;     // magic(u32) + version(u8) +
 static constexpr size_t ACMD_FONT_PAGES = 4;       // RAM font page slots (0..3), replaceable, not persisted
 static constexpr uint16_t ACMD_GLYPH_ABSENT = 0xFFFF; // codeOff[] marker: glyph not in page
 static constexpr unsigned long ACMD_TICK_MS = 10;  // parametric tick floor (~10-30 ms cadence from loop())
+static constexpr uint16_t ACMD_SCROLL_HOLD_PX = 8;      // px-units HELD at each ping-pong extreme before reversing
+static constexpr uint16_t ACMD_SCROLL_MIN_PASS_PX = 12; // min px-units per pass: a barely-overflowing text glides
 enum AcmdOpcode : uint8_t
 {
   ACMD_NOP = 0x00,
@@ -227,19 +229,44 @@ struct AcmdFontPage
 };
 AcmdFontPage acmdFonts[ACMD_FONT_PAGES]; // static storage: zero-initialized (present = false)
 enum AcmdParamType { ACMD_PARAM_NONE = 0, ACMD_PARAM_SWEEP, ACMD_PARAM_SCROLL, ACMD_PARAM_BLINK };
+// A batch arms ALL its parametric primitives, in command order, up to ACMD_PARAMS_MAX
+// (4 — the radar's sweep + up to three scrolling info-column lines); further ones are
+// validated but ignored. Every tick composites the overlays over a fresh base copy in
+// that same order, so a later overlay draws over an earlier one where they overlap.
+static constexpr size_t ACMD_PARAMS_MAX = 4;
+struct AcmdSweepState
+{
+  uint8_t cx, cy, r, speed; // speedDegPerSec 1..255
+  uint16_t color;
+};
+struct AcmdScrollState
+{
+  uint8_t x, y, w, h, fontId;
+  uint16_t color, speedMs;
+  uint8_t len;             // ASCII chars, 1..255
+  char text[256];          // text + NUL
+  int32_t textW;           // sum of glyph advances (+4 per unknown glyph)
+};
+struct AcmdBlinkState
+{
+  uint8_t x, y, w, h;
+  uint16_t periodMs;       // >= 1
+};
+struct AcmdParam
+{
+  AcmdParamType type;
+  union
+  {
+    AcmdSweepState sw;
+    AcmdScrollState sc;
+    AcmdBlinkState bl;
+  } u;
+};
 bool acmdActive = false;
-AcmdParamType acmdParam = ACMD_PARAM_NONE;
+size_t acmdLiveCount = 0;          // armed parametrics (0 = static batch)
+AcmdParam acmdLive[ACMD_PARAMS_MAX];
 unsigned long acmdCommitMs = 0;   // parametric state derives from elapsed ms since commit
 unsigned long acmdLastDrawMs = 0; // tick throttle (cadence jitter must not affect the render)
-uint8_t acmdSwCx = 0, acmdSwCy = 0, acmdSwR = 0, acmdSwSpeed = 0;
-uint16_t acmdSwColor = 0;
-uint8_t acmdScX = 0, acmdScY = 0, acmdScW = 0, acmdScH = 0, acmdScFontId = 0;
-uint16_t acmdScColor = 0, acmdScSpeedMs = 0;
-uint8_t acmdScLen = 0;
-char acmdScText[256]; // SCROLL text scratch: 255 chars + NUL
-int32_t acmdScTextW = 0; // sum of glyph advances (+4 per unknown glyph)
-uint8_t acmdBlX = 0, acmdBlY = 0, acmdBlW = 0, acmdBlH = 0;
-uint16_t acmdBlPeriodMs = 0;
 
 bool init_wifi(char ssid[], char password[]);
 void onConnect(BLEServer *pServer);
@@ -1414,6 +1441,30 @@ static void acmdDrawGlyph(uint16_t *cv, const uint8_t *rec, int32_t penX, int32_
   }
 }
 
+/** Whole-sequence parametric equality (epoch carry-over test): same count, order,
+ * types and every parameter — SCROLL text bytes included. */
+static bool acmdParamsEqual(const AcmdParam &a, const AcmdParam &b)
+{
+  if (a.type != b.type)
+    return false;
+  switch (a.type)
+  {
+  case ACMD_PARAM_SWEEP:
+    return a.u.sw.cx == b.u.sw.cx && a.u.sw.cy == b.u.sw.cy && a.u.sw.r == b.u.sw.r &&
+           a.u.sw.color == b.u.sw.color && a.u.sw.speed == b.u.sw.speed;
+  case ACMD_PARAM_SCROLL:
+    return a.u.sc.x == b.u.sc.x && a.u.sc.y == b.u.sc.y && a.u.sc.w == b.u.sc.w &&
+           a.u.sc.h == b.u.sc.h && a.u.sc.fontId == b.u.sc.fontId &&
+           a.u.sc.color == b.u.sc.color && a.u.sc.speedMs == b.u.sc.speedMs &&
+           a.u.sc.len == b.u.sc.len && memcmp(a.u.sc.text, b.u.sc.text, a.u.sc.len) == 0;
+  case ACMD_PARAM_BLINK:
+    return a.u.bl.x == b.u.bl.x && a.u.bl.y == b.u.bl.y && a.u.bl.w == b.u.bl.w &&
+           a.u.bl.h == b.u.bl.h && a.u.bl.periodMs == b.u.bl.periodMs;
+  default:
+    return false;
+  }
+}
+
 /** ACMD v1 batch parser. FIXED commands: opcode + fixed args. PAYLOAD commands
  *  (BLIT/FONT/TEXT/SCROLL): opcode + payloadLen u16 LE + fixedArgs + payload, where
  *  payloadLen counts ONLY the trailing payload bytes. Any opcode outside the v1 table
@@ -1432,18 +1483,13 @@ void handleAcmd(const byte *payload, unsigned int length)
 
   memset(acmdWork, 0, sizeof(acmdWork)); // each batch fully describes the frame (starts black)
 
-  // Parametric candidate — collected during parse, applied to the live state only at
-  // commit so a dropped batch never corrupts a running overlay.
-  AcmdParamType candParam = ACMD_PARAM_NONE;
-  uint8_t cSwCx = 0, cSwCy = 0, cSwR = 0, cSwSpeed = 0;
-  uint16_t cSwColor = 0;
-  uint8_t cScX = 0, cScY = 0, cScW = 0, cScH = 0, cScFontId = 0;
-  uint16_t cScColor = 0, cScSpeedMs = 0;
-  uint8_t cScLen = 0;
-  char cScText[256];
-  int32_t cScTextW = 0;
-  uint8_t cBlX = 0, cBlY = 0, cBlW = 0, cBlH = 0;
-  uint16_t cBlPeriodMs = 0;
+  // Parametric candidates — collected during parse, applied to the live state only at
+  // commit so a dropped batch never corrupts a running overlay. Up to ACMD_PARAMS_MAX
+  // in command order; later ones are validated but ignored. Static storage: ~1 KB is
+  // too much for the MQTT callback's stack, and ACMD handling is single-threaded
+  // (loop task); candCount resets per call.
+  static AcmdParam cand[ACMD_PARAMS_MAX];
+  size_t candCount = 0;
 
   bool stopParsing = false;
   for (uint16_t ci = 0; ci < cmdCount && !stopParsing; ci++)
@@ -1681,14 +1727,11 @@ void handleAcmd(const byte *payload, unsigned int length)
       pos += 6;
       if (speed < 1)
         return; // spec: 1..255
-      if (candParam == ACMD_PARAM_NONE)
+      if (candCount < ACMD_PARAMS_MAX)
       {
-        candParam = ACMD_PARAM_SWEEP;
-        cSwCx = cx;
-        cSwCy = cy;
-        cSwR = r;
-        cSwColor = color;
-        cSwSpeed = speed;
+        AcmdParam &p = cand[candCount++];
+        p.type = ACMD_PARAM_SWEEP;
+        p.u.sw = {cx, cy, r, speed, color};
       }
       break;
     }
@@ -1725,22 +1768,21 @@ void handleAcmd(const byte *payload, unsigned int length)
         uint16_t off = pg.codeOff[pay[1 + i]];
         textW += (off != ACMD_GLYPH_ABSENT) ? (int8_t)pg.glyphs[off + 3] : 4;
       }
-      if ((int32_t)w + textW + 1 < 1)
-        return; // cycle length must be ≥ 1 (all-negative advances)
-      if (candParam == ACMD_PARAM_NONE)
+      if (candCount < ACMD_PARAMS_MAX)
       {
-        candParam = ACMD_PARAM_SCROLL;
-        cScX = x;
-        cScY = y;
-        cScW = w;
-        cScH = h;
-        cScFontId = fontId;
-        cScColor = color;
-        cScSpeedMs = speedMs;
-        cScLen = pay[0];
-        memcpy(cScText, pay + 1, cScLen);
-        cScText[cScLen] = 0;
-        cScTextW = textW;
+        AcmdParam &p = cand[candCount++];
+        p.type = ACMD_PARAM_SCROLL;
+        p.u.sc.x = x;
+        p.u.sc.y = y;
+        p.u.sc.w = w;
+        p.u.sc.h = h;
+        p.u.sc.fontId = fontId;
+        p.u.sc.color = color;
+        p.u.sc.speedMs = speedMs;
+        p.u.sc.len = pay[0];
+        memcpy(p.u.sc.text, pay + 1, p.u.sc.len);
+        p.u.sc.text[p.u.sc.len] = 0;
+        p.u.sc.textW = textW;
       }
       break;
     }
@@ -1754,14 +1796,11 @@ void handleAcmd(const byte *payload, unsigned int length)
       pos += 6;
       if (periodMs < 1)
         return;
-      if (candParam == ACMD_PARAM_NONE)
+      if (candCount < ACMD_PARAMS_MAX)
       {
-        candParam = ACMD_PARAM_BLINK;
-        cBlX = x;
-        cBlY = y;
-        cBlW = w;
-        cBlH = h;
-        cBlPeriodMs = periodMs;
+        AcmdParam &p = cand[candCount++];
+        p.type = ACMD_PARAM_BLINK;
+        p.u.bl = {x, y, w, h, periodMs};
       }
       break;
     }
@@ -1776,55 +1815,39 @@ void handleAcmd(const byte *payload, unsigned int length)
   }
 
   // Commit: swap work into base, stop animation playback (slot files kept), arm the
-  // winning parametric, push the frame. Everything after this point is live state.
-  // SWEEP phase carry-over: a batch whose winning parametric is a SWEEP identical to
-  // the live one (cx/cy/r/color/speed) keeps the parametric epoch — the phase runs
-  // continuously across refresh republishes, so QoS-0 arrival jitter cannot snap the
-  // line back to 0°. Any param change, another parametric type, or no live overlay
-  // (stopAnimation below clears acmdActive) arms fresh. Decided BEFORE stopAnimation.
-  const bool carrySweepEpoch = acmdActive && acmdParam == ACMD_PARAM_SWEEP &&
-                               candParam == ACMD_PARAM_SWEEP && acmdSwCx == cSwCx &&
-                               acmdSwCy == cSwCy && acmdSwR == cSwR &&
-                               acmdSwColor == cSwColor && acmdSwSpeed == cSwSpeed;
+  // parametric sequence, push the frame. Everything after this point is live state.
+  // Epoch carry-over: a batch whose armed parametric SEQUENCE is identical to the live
+  // one (same count, order, types and parameters — SCROLL text included) keeps the
+  // previous epoch — every overlay's phase runs continuously across refresh
+  // republishes, so QoS-0 arrival jitter cannot snap the sweep back to 0° or restart a
+  // marquee mid-word. Any change (a different sequence, fewer/more parametrics, none),
+  // or anything that clears the ACMD state (stopAnimation clears acmdActive) arms all
+  // parametrics fresh. Decided BEFORE stopAnimation.
+  bool carryEpoch = acmdActive && acmdLiveCount == candCount && candCount > 0;
+  for (size_t i = 0; carryEpoch && i < candCount; i++)
+    carryEpoch = acmdParamsEqual(acmdLive[i], cand[i]);
   memcpy(acmdBase, acmdWork, sizeof(acmdBase));
   stopAnimation(false);
-  acmdParam = candParam;
-  acmdSwCx = cSwCx;
-  acmdSwCy = cSwCy;
-  acmdSwR = cSwR;
-  acmdSwColor = cSwColor;
-  acmdSwSpeed = cSwSpeed;
-  acmdScX = cScX;
-  acmdScY = cScY;
-  acmdScW = cScW;
-  acmdScH = cScH;
-  acmdScFontId = cScFontId;
-  acmdScColor = cScColor;
-  acmdScSpeedMs = cScSpeedMs;
-  acmdScLen = cScLen;
-  memcpy(acmdScText, cScText, cScLen + 1);
-  acmdScTextW = cScTextW;
-  acmdBlX = cBlX;
-  acmdBlY = cBlY;
-  acmdBlW = cBlW;
-  acmdBlH = cBlH;
-  acmdBlPeriodMs = cBlPeriodMs;
-  acmdCommitMs = carrySweepEpoch ? acmdCommitMs : millis(); // carry: keep the epoch
+  for (size_t i = 0; i < candCount; i++)
+    acmdLive[i] = cand[i];
+  acmdLiveCount = candCount;
+  acmdCommitMs = carryEpoch ? acmdCommitMs : millis(); // carry: keep the epoch
   acmdLastDrawMs = acmdCommitMs; // carried epoch is old → next tick fires immediately
   acmdActive = true;
   currentScreenImage = ScreenImage::Client;
   dma_display->drawRGBBitmap(0, 0, acmdWork, W, H);
   Serial.printf("ACMD committed: %u commands%s\n", cmdCount,
-                acmdParam == ACMD_PARAM_NONE ? "" : " + parametric");
+                acmdLiveCount == 0 ? "" : " + parametric");
 }
 
-/** Parametric overlay tick (~10 ms floor, called from loop()): composites the overlay
- *  over a fresh copy of the immutable base canvas and pushes it. All animation state
- *  derives from elapsed milliseconds since commit — never from tick counts — so loop
- *  cadence jitter cannot drift or stall the sweep/scroll/blink phase. */
+/** Parametric overlay tick (~10 ms floor, called from loop()): composites ALL armed
+ * overlays over a fresh copy of the immutable base canvas and pushes it. All animation
+ * state derives from elapsed milliseconds since commit — never from tick counts — so
+ * loop cadence jitter cannot drift or stall a phase. Overlays apply in command order,
+ * so a later overlay draws over an earlier one where their regions overlap. */
 void acmdTick()
 {
-  if (!acmdActive || acmdParam == ACMD_PARAM_NONE)
+  if (!acmdActive || acmdLiveCount == 0)
     return;
   unsigned long now = millis();
   if (now - acmdLastDrawMs < ACMD_TICK_MS)
@@ -1832,56 +1855,83 @@ void acmdTick()
   acmdLastDrawMs = now;
   unsigned long elapsed = now - acmdCommitMs;
 
-  // Restores the SCROLL/BLINK region snapshots: base is immutable after commit, so a
-  // full copy is exactly the snapshot-restore semantics.
+  // Fresh base copy = the per-overlay "region snapshot restore" semantics.
   memcpy(acmdWork, acmdBase, sizeof(acmdWork));
-  switch (acmdParam)
+  for (size_t pi = 0; pi < acmdLiveCount; pi++)
   {
-  case ACMD_PARAM_SWEEP:
-  {
-    // θ = (elapsedMs × speed / 1000) mod 360; endpoint in double, lround (half away
-    // from zero); GFX line from the center over the base each tick.
-    uint32_t deg = (uint32_t)(((uint64_t)elapsed * acmdSwSpeed / 1000) % 360);
-    double rad = (double)deg * M_PI / 180.0;
-    int16_t ex = (int16_t)lround((double)acmdSwCx + (double)acmdSwR * cos(rad));
-    int16_t ey = (int16_t)lround((double)acmdSwCy + (double)acmdSwR * sin(rad));
-    acmdWriteLine(acmdWork, acmdSwCx, acmdSwCy, ex, ey, acmdSwColor);
-    break;
-  }
-  case ACMD_PARAM_SCROLL:
-  {
-    // Leftward marquee: penX0 = (x + w) − scrolledPx; when scrolledPx exceeds
-    // w + textWidth + 1 the cycle restarts (scrolledPx mod (w + textWidth + 1)).
-    uint32_t cycle = (uint32_t)acmdScW + (uint32_t)acmdScTextW + 1;
-    uint32_t scrolledPx = (elapsed / acmdScSpeedMs) % cycle;
-    int32_t penX = (int32_t)acmdScX + (int32_t)acmdScW - (int32_t)scrolledPx;
-    const AcmdFontPage &pg = acmdFonts[acmdScFontId];
-    for (uint8_t i = 0; i < acmdScLen; i++)
+    const AcmdParam &p = acmdLive[pi];
+    switch (p.type)
     {
-      uint16_t off = pg.codeOff[(uint8_t)acmdScText[i]];
-      if (off != ACMD_GLYPH_ABSENT)
-      {
-        acmdDrawGlyph(acmdWork, pg.glyphs + off, penX, acmdScY, acmdScColor,
-                      true, acmdScX, acmdScY, acmdScW, acmdScH);
-        penX += (int8_t)pg.glyphs[off + 3];
-      }
-      else
-        penX += 4;
+    case ACMD_PARAM_SWEEP:
+    {
+      // θ = (elapsedMs × speed / 1000) mod 360; endpoint in double, lround (half away
+      // from zero); GFX line from the center over the base each tick.
+      uint32_t deg = (uint32_t)(((uint64_t)elapsed * p.u.sw.speed / 1000) % 360);
+      double rad = (double)deg * M_PI / 180.0;
+      int16_t ex = (int16_t)lround((double)p.u.sw.cx + (double)p.u.sw.r * cos(rad));
+      int16_t ey = (int16_t)lround((double)p.u.sw.cy + (double)p.u.sw.r * sin(rad));
+      acmdWriteLine(acmdWork, p.u.sw.cx, p.u.sw.cy, ex, ey, p.u.sw.color);
+      break;
     }
-    break;
-  }
-  case ACMD_PARAM_BLINK:
-  {
-    // Alternate content ↔ black every periodMs/2; the first half shows content
-    // (content = the base copy already in acmdWork).
-    if ((elapsed % acmdBlPeriodMs) >= acmdBlPeriodMs / 2)
-      for (int16_t py = acmdBlY; py < acmdBlY + acmdBlH; py++)
-        for (int16_t px = acmdBlX; px < acmdBlX + acmdBlW; px++)
-          acmdPixel(acmdWork, px, py, 0);
-    break;
-  }
-  default:
-    break;
+    case ACMD_PARAM_SCROLL:
+    {
+      // Ping-pong marquee with readability pacing: penX oscillates between the
+      // head-visible extreme (penX = x, tail clipped right) and the tail-visible
+      // extreme (penX = x + w − textW, head clipped left) — the text never leaves
+      // the region — HOLDING ACMD_SCROLL_HOLD_PX px-units of time at each extreme
+      // before reversing. One pass travels travel = textW − w px in at least
+      // ACMD_SCROLL_MIN_PASS_PX px-units (a barely-overflowing text glides instead
+      // of rattling); one px-unit is speedMs. Phase 0 = the head hold. A text that
+      // fits (textW ≤ w) has no travel: it renders statically at x.
+      int32_t travel = (int32_t)p.u.sc.textW - (int32_t)p.u.sc.w;
+      int32_t penX;
+      if (travel < 1)
+        penX = p.u.sc.x;
+      else
+      {
+        int32_t vt = travel < (int32_t)ACMD_SCROLL_MIN_PASS_PX ? (int32_t)ACMD_SCROLL_MIN_PASS_PX : travel;
+        uint32_t passMs = (uint32_t)vt * p.u.sc.speedMs;
+        uint32_t holdMs = (uint32_t)ACMD_SCROLL_HOLD_PX * p.u.sc.speedMs;
+        uint32_t cyc = elapsed % (2 * (holdMs + passMs));
+        int32_t pen; // px left of the head extreme, 0..travel
+        if (cyc < holdMs)
+          pen = 0; // head hold
+        else if (cyc < holdMs + passMs)
+          pen = (int32_t)((uint64_t)(cyc - holdMs) * (uint32_t)travel / passMs); // right → left pass
+        else if (cyc < 2 * holdMs + passMs)
+          pen = travel; // tail hold
+        else
+          pen = travel - (int32_t)((uint64_t)(cyc - 2 * holdMs - passMs) * (uint32_t)travel / passMs); // left → right pass
+        penX = p.u.sc.x - pen;
+      }
+      const AcmdFontPage &pg = acmdFonts[p.u.sc.fontId];
+      for (uint8_t gi = 0; gi < p.u.sc.len; gi++)
+      {
+        uint16_t off = pg.codeOff[(uint8_t)p.u.sc.text[gi]];
+        if (off != ACMD_GLYPH_ABSENT)
+        {
+          acmdDrawGlyph(acmdWork, pg.glyphs + off, penX, p.u.sc.y, p.u.sc.color,
+                        true, p.u.sc.x, p.u.sc.y, p.u.sc.w, p.u.sc.h);
+          penX += (int8_t)pg.glyphs[off + 3];
+        }
+        else
+          penX += 4;
+      }
+      break;
+    }
+    case ACMD_PARAM_BLINK:
+    {
+      // Alternate content ↔ black every periodMs/2; the first half shows content
+      // (content = the base copy already in acmdWork).
+      if ((elapsed % p.u.bl.periodMs) >= p.u.bl.periodMs / 2)
+        for (int16_t py = p.u.bl.y; py < p.u.bl.y + p.u.bl.h; py++)
+          for (int16_t px = p.u.bl.x; px < p.u.bl.x + p.u.bl.w; px++)
+            acmdPixel(acmdWork, px, py, 0);
+      break;
+    }
+    default:
+      break;
+    }
   }
   dma_display->drawRGBBitmap(0, 0, acmdWork, W, H);
 }
