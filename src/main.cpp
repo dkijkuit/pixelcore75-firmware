@@ -115,15 +115,57 @@ static constexpr const char *TOPIC_ANIM_PLAY = "/anim/play";
 static constexpr const char *TOPIC_ANIM_LOADED = "/anim/loaded";
 static constexpr const char *ANIM_UPLOAD_PATH = "/anim_up.bin"; // staging file while an upload is in flight
 static constexpr uint8_t ANIM_MAX_SLOTS = 32; // persistent animation slots; capacity-bound, eviction self-heals via re-upload
-static constexpr size_t ANIM_FILE_HEADER_BYTES = 4; // frameCount(u16) + delayMs(u16)
+static constexpr size_t ANIM_FILE_HEADER_BYTES = 4; // v1 slot file: frameCount(u16) + delayMs(u16)
 static constexpr size_t ANIM_START_PAYLOAD = 14;    // magic + frameCount + delayMs + uploadId + flags + slot
-static constexpr size_t ANIM_FRAME_PAYLOAD = 6 + FRAME_BYTES; // magic + frameIdx + pixels
+static constexpr size_t ANIM_FRAME_PAYLOAD = 6 + FRAME_BYTES; // v1 ANIF: magic + frameIdx + pixels
+static constexpr size_t ANIM_FRAME_V2_MIN = 103;    // v2 ANIF floor: header + palette + one run per row (32 rows)
+static constexpr size_t ANIM_FRAME_V2_MAX = 4103;   // v2 ANIF ceiling: header + 4096B RAW body
+static constexpr size_t ANIM_FRAME_V2_HEADER_BYTES = 7; // v2 ANIF: magic + frameIdx + frameFlags
+static constexpr uint16_t SLOT_FILE_V2_MAGIC = 0x3241;  // "A2" (bytes 0x41 0x32); v1 would read it as
+                                                        // frameCount 12865 > 200, so the formats can't collide
+static constexpr size_t SLOT_FILE_V2_HEADER_BYTES = 6;  // v2 slot file: magic(u16) + frameCount(u16) + delayMs(u16)
+static constexpr size_t PAL_RLE_PALETTE_BYTES = 32;     // 16 entries x RGB565 LE
 static constexpr size_t ANIM_PLAY_PAYLOAD = 9;      // magic + slot + uploadId
 static constexpr size_t ANIM_LOADED_PAYLOAD = 9;    // magic + slot + uploadId
+static constexpr uint32_t SLOTIDX_MAGIC = 0x49544C53;       // "SLTI" little-endian
+static constexpr const char *SLOTIDX_PATH = "/slotidx.bin"; // per-slot uploadId index: content-hash cache for /anim/play
+static constexpr uint32_t ACMD_MAGIC = 0x444D4341; // "ACMD" little-endian (parametric command batch)
+static constexpr uint8_t ACMD_VERSION = 1;         // wrong version drops the whole batch
+static constexpr const char *TOPIC_CMD = "/cmd";   // server-rendered command channel (QoS 0, not retained)
+static constexpr size_t ACMD_HEADER_BYTES = 7;     // magic(u32) + version(u8) + cmdCount(u16 LE)
+static constexpr size_t ACMD_FONT_PAGES = 4;       // RAM font page slots (0..3), replaceable, not persisted
+static constexpr uint16_t ACMD_GLYPH_ABSENT = 0xFFFF; // codeOff[] marker: glyph not in page
+static constexpr unsigned long ACMD_TICK_MS = 10;  // parametric tick floor (~10-30 ms cadence from loop())
+static constexpr uint16_t ACMD_SCROLL_HOLD_PX = 8;      // px-units HELD at each ping-pong extreme before reversing
+static constexpr uint16_t ACMD_SCROLL_MIN_PASS_PX = 12; // min px-units per pass: a barely-overflowing text glides
+enum AcmdOpcode : uint8_t
+{
+  ACMD_NOP = 0x00,
+  ACMD_CLS = 0x01,
+  ACMD_PIX = 0x02,
+  ACMD_LINE = 0x03,
+  ACMD_RECT = 0x04,
+  ACMD_FILL = 0x05,
+  ACMD_CIRC = 0x06,
+  ACMD_BLIT = 0x07,
+  ACMD_FONT = 0x10,
+  ACMD_TEXT = 0x11,
+  ACMD_SWEEP = 0x20,
+  ACMD_SCROLL = 0x21,
+  ACMD_BLINK = 0x22
+};
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+static constexpr uint8_t SLOTIDX_VERSION = 1;
+static constexpr size_t SLOTIDX_FILE_BYTES = 5 + ANIM_MAX_SLOTS * 4; // magic + version + one u32 uploadId per slot
 static constexpr uint8_t ANIM_FLAG_STAGE_ONLY = 0x01; // stage to flash but wait for /anim/play
+static constexpr uint8_t ANIM_FLAG_CODEC_MASK = 0x06; // bits 1-2 = upload codec
+static constexpr uint8_t ANIM_FLAG_CODEC_PAL_RLE = 0x02; // codec 1: per-frame RAW/PAL_RLE, v2 slot file
 static constexpr uint16_t MAX_ANIM_FRAMES = 200;    // sanity cap; ~800KB fits the ~4.9MB LittleFS many times over
 static constexpr uint16_t ANIM_MIN_DELAY_MS = 10;
-static constexpr size_t ANIM_RING_FRAMES = 8;  // RAM frame ring (8*4KB): decouples MQTT from flash writes
+static constexpr size_t ANIM_RING_FRAMES = 8;  // RAM frame ring (8 slots): decouples MQTT from flash writes
+static constexpr size_t ANIM_RING_SLOT_BYTES = 4104; // worst-case buffered blob: v2 frameFlags + 4096B body
 static constexpr size_t ANIM_FLUSH_CHUNK = 256; // one flash page per loop pass while an animation plays
 
 uint8_t rxBuf[FRAME_BYTES];       // raw bytes from MQTT
@@ -131,6 +173,8 @@ uint16_t *px = (uint16_t *)rxBuf; // view as RGB565 pixels (little-endian)
 
 bool animActive = false;
 bool animUploading = false;
+bool animUploadV2 = false;   // current upload uses codec 1 (per-frame blobs, v2 slot file)
+bool animPlayingV2 = false;  // playing slot is v2 format (offset table + blobs); v1 = fixed-size frames
 bool animLoadedAckPending = false;
 uint32_t animUploadId = 0;
 bool animStageOnly = false;     // current upload stages but doesn't play on completion
@@ -139,6 +183,12 @@ uint8_t animPlayingSlot = 0;    // slot currently playing (auto-resume after rec
 uint8_t animAckSlot = 0;        // ack payload while animLoadedAckPending
 uint32_t animAckUploadId = 0;   // ack payload while animLoadedAckPending
 uint32_t animPlayRequestId = 0; // /anim/play that arrived while the upload was still running
+uint32_t animSlotUploadIds[ANIM_MAX_SLOTS] = {0}; // RAM mirror of /slotidx.bin; 0 = slot content unknown
+uint32_t animUploadBlobBytes = 0;               // v2 upload: blob bytes accepted so far (ring + flushed)
+uint32_t animFrameOffsets[MAX_ANIM_FRAMES];     // v2 upload: absolute blob offsets in the staging file
+uint32_t animPlayOffsets[MAX_ANIM_FRAMES];      // v2 playback: absolute blob offsets in the slot file
+uint32_t animPlayFileSize = 0;                  // v2 playback: bounds blob reads (last blob runs to EOF)
+uint8_t animV2Scratch[ANIM_FRAME_V2_MAX - ANIM_FRAME_V2_HEADER_BYTES - PAL_RLE_PALETTE_BYTES]; // PAL_RLE pairs (4064 B)
 uint16_t animUploadCount = 0;
 uint16_t animExpectedIdx = 0;
 uint16_t animFrameCount = 0;
@@ -154,11 +204,69 @@ File animUploadFile; // staging file, held open for the whole upload (per-frame 
 // block erases tens of ms), so doing them inline in the callback froze the animation
 // tick for the whole 4KB frame. Backpressure: loop() stops calling client.loop() when
 // the ring is nearly full, so TCP/MQTT flow control throttles the server instead.
-uint8_t animRing[ANIM_RING_FRAMES][FRAME_BYTES];
+// Slots hold one frame blob each: FRAME_BYTES for v1 uploads, frameFlags+body (1..4097 B)
+// for v2 — animRingLen tracks the valid length of each slot.
+uint8_t animRing[ANIM_RING_FRAMES][ANIM_RING_SLOT_BYTES];
+size_t animRingLen[ANIM_RING_FRAMES]; // valid bytes per slot (set when the frame is queued)
 size_t animRingHead = 0;       // next free frame (writer: MQTT callback)
 size_t animRingTail = 0;       // oldest buffered frame (reader: loop flusher)
 size_t animRingCount = 0;      // frames buffered
 size_t animRingFlushed = 0;    // bytes of the tail frame already written to flash
+
+// ACMD parametric command engine: batches render into the work canvas and commit
+// atomically (base canvas swap + display push + parametric arming). The base canvas is
+// immutable after commit, so parametric overlays (SWEEP/SCROLL/BLINK) composite over a
+// fresh copy of it every tick — that copy also IS the "region snapshot restore" of the
+// SCROLL/BLINK semantics (their snapshots equal the base region at commit time).
+uint16_t acmdBase[W * H]; // committed frame
+uint16_t acmdWork[W * H]; // batch render scratch + parametric composite buffer
+struct AcmdFontPage
+{
+  bool present;           // at least one FONT command has loaded this page (RAM only, never persisted)
+  uint8_t *glyphs;        // packed records: code,w,h,xAdvance,xOff,yOff + h*ceil(w/8) bitmap bytes
+  size_t glyphsLen;
+  uint16_t codeOff[256];  // record offset per char code; ACMD_GLYPH_ABSENT = not in page
+};
+AcmdFontPage acmdFonts[ACMD_FONT_PAGES]; // static storage: zero-initialized (present = false)
+enum AcmdParamType { ACMD_PARAM_NONE = 0, ACMD_PARAM_SWEEP, ACMD_PARAM_SCROLL, ACMD_PARAM_BLINK };
+// A batch arms ALL its parametric primitives, in command order, up to ACMD_PARAMS_MAX
+// (4 — the radar's sweep + up to three scrolling info-column lines); further ones are
+// validated but ignored. Every tick composites the overlays over a fresh base copy in
+// that same order, so a later overlay draws over an earlier one where they overlap.
+static constexpr size_t ACMD_PARAMS_MAX = 4;
+struct AcmdSweepState
+{
+  uint8_t cx, cy, r, speed; // speedDegPerSec 1..255
+  uint16_t color;
+};
+struct AcmdScrollState
+{
+  uint8_t x, y, w, h, fontId;
+  uint16_t color, speedMs;
+  uint8_t len;             // ASCII chars, 1..255
+  char text[256];          // text + NUL
+  int32_t textW;           // sum of glyph advances (+4 per unknown glyph)
+};
+struct AcmdBlinkState
+{
+  uint8_t x, y, w, h;
+  uint16_t periodMs;       // >= 1
+};
+struct AcmdParam
+{
+  AcmdParamType type;
+  union
+  {
+    AcmdSweepState sw;
+    AcmdScrollState sc;
+    AcmdBlinkState bl;
+  } u;
+};
+bool acmdActive = false;
+size_t acmdLiveCount = 0;          // armed parametrics (0 = static batch)
+AcmdParam acmdLive[ACMD_PARAMS_MAX];
+unsigned long acmdCommitMs = 0;   // parametric state derives from elapsed ms since commit
+unsigned long acmdLastDrawMs = 0; // tick throttle (cadence jitter must not affect the render)
 
 bool init_wifi(char ssid[], char password[]);
 void onConnect(BLEServer *pServer);
@@ -184,6 +292,8 @@ void completeAnimUpload();
 void handleAnimStart(const byte *payload, unsigned int length);
 void handleAnimFrame(const byte *payload, unsigned int length);
 void handleAnimPlay(const byte *payload, unsigned int length);
+void handleAcmd(const byte *payload, unsigned int length);
+void acmdTick();
 
 void drawBitmap(
     int16_t x,
@@ -554,6 +664,7 @@ void setAsciiValue(BLECharacteristic *ch, const String &val)
 void abortAnimUpload()
 {
   animUploading = false;
+  animUploadV2 = false;
   animStageOnly = false;
   animPlayRequestId = 0;
   animRingHead = animRingTail = animRingCount = 0;
@@ -570,6 +681,69 @@ static const char *animSlotPath(uint8_t slot)
   static char buf[12]; // "/a31.bin" + NUL, with headroom
   snprintf(buf, sizeof(buf), "/a%u.bin", slot);
   return buf;
+}
+
+/** Load the slot upload-id index. Anything missing or invalid (bad magic/version/size)
+ *  leaves all zeros, which merely disables the ANIP hash-skip until the next completed
+ *  upload rewrites the file — a reflash or corrupt index costs one redundant upload. */
+static void loadSlotUploadIds()
+{
+  memset(animSlotUploadIds, 0, sizeof(animSlotUploadIds));
+  if (!LittleFS.exists(SLOTIDX_PATH))
+    return;
+  File f = LittleFS.open(SLOTIDX_PATH, FILE_READ);
+  if (!f)
+    return;
+  uint8_t ids[SLOTIDX_FILE_BYTES];
+  bool valid = f.size() == SLOTIDX_FILE_BYTES &&
+               f.seek(0) &&
+               f.read(ids, sizeof(ids)) == sizeof(ids);
+  f.close();
+  uint32_t magic = 0;
+  if (valid)
+    memcpy(&magic, ids, sizeof(magic));
+  if (!valid || magic != SLOTIDX_MAGIC || ids[4] != SLOTIDX_VERSION)
+    return;
+  for (uint8_t s = 0; s < ANIM_MAX_SLOTS; s++)
+  {
+    size_t o = 5 + (size_t)s * 4;
+    animSlotUploadIds[s] = (uint32_t)ids[o] | ((uint32_t)ids[o + 1] << 8) |
+                           ((uint32_t)ids[o + 2] << 16) | ((uint32_t)ids[o + 3] << 24);
+  }
+}
+
+/** Persist the slot upload-id index. Full-file rewrite (133 bytes) — entries only change
+ *  on upload completion, ladder eviction or corrupt-file deletion, all rare events. */
+static void saveSlotUploadIds()
+{
+  uint8_t ids[SLOTIDX_FILE_BYTES] = {'S', 'L', 'T', 'I', SLOTIDX_VERSION};
+  for (uint8_t s = 0; s < ANIM_MAX_SLOTS; s++)
+  {
+    uint32_t id = animSlotUploadIds[s];
+    size_t o = 5 + (size_t)s * 4;
+    ids[o] = (uint8_t)(id & 0xFF);
+    ids[o + 1] = (uint8_t)(id >> 8);
+    ids[o + 2] = (uint8_t)(id >> 16);
+    ids[o + 3] = (uint8_t)(id >> 24);
+  }
+  File f = LittleFS.open(SLOTIDX_PATH, FILE_WRITE);
+  if (!f)
+    return;
+  if (f.write(ids, sizeof(ids)) != sizeof(ids))
+  {
+    f.close();
+    LittleFS.remove(SLOTIDX_PATH); // truncated index: load treats it as all zeros anyway
+    return;
+  }
+  f.close();
+}
+
+static void setSlotUploadId(uint8_t slot, uint32_t uploadId)
+{
+  if (slot >= ANIM_MAX_SLOTS || animSlotUploadIds[slot] == uploadId)
+    return;
+  animSlotUploadIds[slot] = uploadId;
+  saveSlotUploadIds();
 }
 
 void playSlot(uint8_t slot, uint32_t uploadId)
@@ -591,6 +765,8 @@ void stopAnimation(bool removePlayingSlot)
 {
   bool wasUploading = animUploading;
   animActive = false;
+  acmdActive = false; // static frames, animation starts and reconnect auto-resume supersede ACMD
+  animPlayingV2 = false;
   animUploading = false;
   animLoadedAckPending = false;
   if (animFile)
@@ -613,11 +789,85 @@ void animationTick()
   if (millis() - animLastFrameMs >= animDelayMs)
     animLastFrameMs = millis(); // fell a full frame or more behind: resync, don't fast-forward
 
-  size_t offset = ANIM_FILE_HEADER_BYTES + (size_t)animFrameIdx * FRAME_BYTES;
-  if (!animFile.seek(offset) || animFile.read(animBuf, FRAME_BYTES) != FRAME_BYTES)
+  if (animPlayingV2)
   {
-    stopAnimation(true);
-    return;
+    // v2 slot file: seek this frame's blob, dispatch on its per-frame flag. Ingest already
+    // validated the structure; any read/decode failure here means flash corruption → the
+    // v1 remedy (stop + delete) applies to both formats.
+    uint32_t blob = animPlayOffsets[animFrameIdx];
+    if (!animFile.seek(blob))
+    {
+      stopAnimation(true);
+      return;
+    }
+    uint8_t frameFlags = 0;
+    if (animFile.read(&frameFlags, 1) != 1)
+    {
+      stopAnimation(true);
+      return;
+    }
+    if (frameFlags == 0)
+    {
+      if (animFile.read(animBuf, FRAME_BYTES) != FRAME_BYTES)
+      {
+        stopAnimation(true);
+        return;
+      }
+    }
+    else if (frameFlags == 1)
+    {
+      uint8_t pal[PAL_RLE_PALETTE_BYTES];
+      if (animFile.read(pal, sizeof(pal)) != sizeof(pal))
+      {
+        stopAnimation(true);
+        return;
+      }
+      uint16_t pal16[16];
+      for (uint8_t c = 0; c < 16; c++)
+        pal16[c] = (uint16_t)pal[2 * c] | ((uint16_t)pal[2 * c + 1] << 8);
+      // The last blob runs to EOF; cap the pair read at the scratch size (a valid frame
+      // never needs more, since ingest enforced the 4103-byte ANIF ceiling).
+      uint32_t remain = animPlayFileSize - blob - 1 - sizeof(pal);
+      size_t rd = remain < sizeof(animV2Scratch) ? remain : sizeof(animV2Scratch);
+      if (animFile.read(animV2Scratch, rd) != rd)
+      {
+        stopAnimation(true);
+        return;
+      }
+      uint16_t *out = (uint16_t *)animBuf;
+      size_t done = 0;
+      for (size_t p = 0; p < rd / 2; p++)
+      {
+        uint8_t run = animV2Scratch[2 * p];
+        uint8_t ci = animV2Scratch[2 * p + 1];
+        if (run < 1 || ci > 15 || done + run > W * H)
+        {
+          stopAnimation(true); // corrupt pair: never index past the palette or buffer
+          return;
+        }
+        for (uint8_t r = 0; r < run; r++)
+          out[done++] = pal16[ci];
+      }
+      if (done != W * H)
+      {
+        stopAnimation(true);
+        return;
+      }
+    }
+    else
+    {
+      stopAnimation(true); // unknown per-frame flag: corrupt blob
+      return;
+    }
+  }
+  else
+  {
+    size_t offset = ANIM_FILE_HEADER_BYTES + (size_t)animFrameIdx * FRAME_BYTES;
+    if (!animFile.seek(offset) || animFile.read(animBuf, FRAME_BYTES) != FRAME_BYTES)
+    {
+      stopAnimation(true);
+      return;
+    }
   }
 
   dma_display->drawRGBBitmap(0, 0, (uint16_t *)animBuf, W, H);
@@ -639,27 +889,70 @@ void startAnimation(uint8_t slot)
   if (!f)
     return;
 
-  uint8_t hdr[ANIM_FILE_HEADER_BYTES];
-  bool valid = f.size() >= ANIM_FILE_HEADER_BYTES + FRAME_BYTES &&
-               f.seek(0) &&
-               f.read(hdr, ANIM_FILE_HEADER_BYTES) == ANIM_FILE_HEADER_BYTES;
+  // Format sniff on the first two bytes: "A2" = v2 (offset table + per-frame blobs),
+  // anything else = v1 (fixed-size frames). Unambiguous: read as a v1 frameCount, the
+  // magic is 12865 > MAX_ANIM_FRAMES, so no v1 file can start with it.
+  uint8_t hdr[SLOT_FILE_V2_HEADER_BYTES];
+  bool valid = f.size() >= 2 && f.seek(0) && f.read(hdr, 2) == 2;
+  bool v2 = valid && hdr[0] == (uint8_t)(SLOT_FILE_V2_MAGIC & 0xFF) &&
+            hdr[1] == (uint8_t)(SLOT_FILE_V2_MAGIC >> 8);
   if (valid)
   {
-    animFrameCount = hdr[0] | (hdr[1] << 8);
-    animDelayMs = hdr[2] | (hdr[3] << 8);
-    valid = animFrameCount >= 2 && animFrameCount <= MAX_ANIM_FRAMES &&
-            f.size() == ANIM_FILE_HEADER_BYTES + (size_t)animFrameCount * FRAME_BYTES;
+    if (v2)
+    {
+      valid = f.size() >= SLOT_FILE_V2_HEADER_BYTES && f.seek(0) &&
+              f.read(hdr, SLOT_FILE_V2_HEADER_BYTES) == SLOT_FILE_V2_HEADER_BYTES;
+      if (valid)
+      {
+        animFrameCount = hdr[2] | (hdr[3] << 8);
+        animDelayMs = hdr[4] | (hdr[5] << 8);
+        size_t tableEnd = SLOT_FILE_V2_HEADER_BYTES + (size_t)animFrameCount * 4;
+        // Offset table must be readable, start at/after its own end, be monotonic
+        // non-decreasing and point every blob inside the file (so the last blob ends
+        // at/before EOF — it runs to EOF during playback).
+        valid = animFrameCount >= 2 && animFrameCount <= MAX_ANIM_FRAMES &&
+                f.size() > tableEnd && f.seek(SLOT_FILE_V2_HEADER_BYTES);
+        uint32_t prev = (uint32_t)tableEnd;
+        for (uint16_t i = 0; valid && i < animFrameCount; i++)
+        {
+          uint8_t e[4];
+          valid = f.read(e, 4) == 4;
+          uint32_t off = 0;
+          if (valid)
+            off = (uint32_t)e[0] | ((uint32_t)e[1] << 8) | ((uint32_t)e[2] << 16) | ((uint32_t)e[3] << 24);
+          valid = valid && off >= prev && off < f.size();
+          prev = off;
+          if (valid)
+            animPlayOffsets[i] = off;
+        }
+        animPlayFileSize = f.size();
+      }
+    }
+    else
+    {
+      valid = f.size() >= ANIM_FILE_HEADER_BYTES + FRAME_BYTES && f.seek(0) &&
+              f.read(hdr, ANIM_FILE_HEADER_BYTES) == ANIM_FILE_HEADER_BYTES;
+      if (valid)
+      {
+        animFrameCount = hdr[0] | (hdr[1] << 8);
+        animDelayMs = hdr[2] | (hdr[3] << 8);
+        valid = animFrameCount >= 2 && animFrameCount <= MAX_ANIM_FRAMES &&
+                f.size() == ANIM_FILE_HEADER_BYTES + (size_t)animFrameCount * FRAME_BYTES;
+      }
+    }
   }
   if (!valid)
   {
     f.close();
     LittleFS.remove(path);
+    setSlotUploadId(slot, 0); // index must not claim content for a deleted file
     return;
   }
 
   if (animDelayMs < ANIM_MIN_DELAY_MS)
     animDelayMs = ANIM_MIN_DELAY_MS;
 
+  animPlayingV2 = v2;
   animPlayingSlot = slot;
   animFile = f;
   animFrameIdx = 0;
@@ -683,6 +976,10 @@ void handleAnimStart(const byte *payload, unsigned int length)
   uint32_t uploadId = (uint32_t)payload[8] | ((uint32_t)payload[9] << 8) |
                       ((uint32_t)payload[10] << 16) | ((uint32_t)payload[11] << 24);
   bool stageOnly = (payload[12] & ANIM_FLAG_STAGE_ONLY) != 0;
+  uint8_t codecBits = payload[12] & ANIM_FLAG_CODEC_MASK;
+  if (codecBits != 0 && codecBits != ANIM_FLAG_CODEC_PAL_RLE)
+    return; // unknown codec (2-3): silent drop, the server times out and downgrades to RAW
+  bool v2 = codecBits == ANIM_FLAG_CODEC_PAL_RLE;
   uint8_t slot = payload[13];
   if (slot >= ANIM_MAX_SLOTS)
     return;
@@ -700,18 +997,32 @@ void handleAnimStart(const byte *payload, unsigned int length)
   LittleFS.remove(ANIM_UPLOAD_PATH); // stale partial upload from an earlier attempt
 
   // Space ladder for the staging file: drop the slot file being replaced first, then idle
-  // slot files, and only as a last resort the playing animation.
+  // slot files, and only as a last resort the playing animation. Every dropped file also
+  // invalidates its slotidx entry so the index never outlives the content it describes.
+  // The estimate is the v1 worst case (4 + count*4096); v2 uploads land smaller, so it
+  // stays a safe upper bound.
   size_t needed = ANIM_FILE_HEADER_BYTES + (size_t)count * FRAME_BYTES;
   auto freeOk = [&]() { return LittleFS.totalBytes() - LittleFS.usedBytes() >= needed; };
-  LittleFS.remove(animSlotPath(slot));
+  bool idxDirty = false;
+  auto dropSlot = [&](uint8_t s) {
+    LittleFS.remove(animSlotPath(s));
+    if (animSlotUploadIds[s] != 0)
+    {
+      animSlotUploadIds[s] = 0;
+      idxDirty = true;
+    }
+  };
+  dropSlot(slot);
   if (!freeOk())
     for (uint8_t s = 0; s < ANIM_MAX_SLOTS && !freeOk(); s++)
       if (s != slot && !(animActive && s == animPlayingSlot))
-        LittleFS.remove(animSlotPath(s));
+        dropSlot(s);
   if (!freeOk() && animActive)
     stopAnimation(false); // sacrifice the playing animation, keep its file for last
   if (!freeOk())
-    LittleFS.remove(animSlotPath(animPlayingSlot));
+    dropSlot(animPlayingSlot);
+  if (idxDirty)
+    saveSlotUploadIds();
   if (!freeOk())
     return;
 
@@ -719,10 +1030,40 @@ void handleAnimStart(const byte *payload, unsigned int length)
   if (!f)
     return;
 
-  uint8_t hdr[ANIM_FILE_HEADER_BYTES] = {
-      (uint8_t)(count & 0xFF), (uint8_t)(count >> 8),
-      (uint8_t)(delayMs & 0xFF), (uint8_t)(delayMs >> 8)};
-  bool ok = f.write(hdr, ANIM_FILE_HEADER_BYTES) == ANIM_FILE_HEADER_BYTES;
+  // v1 staging: 4-byte header + raw frames. v2 staging: 6-byte header + a zeroed
+  // placeholder offset table (patched with the real blob offsets on completion).
+  uint8_t hdr[SLOT_FILE_V2_HEADER_BYTES];
+  size_t hdrLen;
+  if (v2)
+  {
+    hdr[0] = (uint8_t)(SLOT_FILE_V2_MAGIC & 0xFF);
+    hdr[1] = (uint8_t)(SLOT_FILE_V2_MAGIC >> 8);
+    hdr[2] = (uint8_t)(count & 0xFF);
+    hdr[3] = (uint8_t)(count >> 8);
+    hdr[4] = (uint8_t)(delayMs & 0xFF);
+    hdr[5] = (uint8_t)(delayMs >> 8);
+    hdrLen = SLOT_FILE_V2_HEADER_BYTES;
+  }
+  else
+  {
+    hdr[0] = (uint8_t)(count & 0xFF);
+    hdr[1] = (uint8_t)(count >> 8);
+    hdr[2] = (uint8_t)(delayMs & 0xFF);
+    hdr[3] = (uint8_t)(delayMs >> 8);
+    hdrLen = ANIM_FILE_HEADER_BYTES;
+  }
+  bool ok = f.write(hdr, hdrLen) == hdrLen;
+  if (ok && v2)
+  {
+    static const uint8_t zeros[64] = {0};
+    size_t tableBytes = (size_t)count * 4;
+    while (ok && tableBytes > 0)
+    {
+      size_t chunk = tableBytes < sizeof(zeros) ? tableBytes : sizeof(zeros);
+      ok = f.write(zeros, chunk) == chunk;
+      tableBytes -= chunk;
+    }
+  }
   if (!ok)
   {
     f.close();
@@ -731,20 +1072,58 @@ void handleAnimStart(const byte *payload, unsigned int length)
   }
   animUploadFile = f; // kept open until the upload completes or aborts
 
-  Serial.printf("Animation upload started: slot %u, %u frames, %u ms delay%s\n",
-                slot, count, delayMs, stageOnly ? " (stage-only)" : "");
+  Serial.printf("Animation upload started: slot %u, %u frames, %u ms delay%s%s\n",
+                slot, count, delayMs, v2 ? " (PAL_RLE)" : "", stageOnly ? " (stage-only)" : "");
 
   animUploadId = uploadId;
   animStageOnly = stageOnly;
   animSlot = slot;
   animUploadCount = count;
   animExpectedIdx = 0;
+  animUploadV2 = v2;
+  animUploadBlobBytes = 0;
   animUploading = true;
+}
+
+/** Structural ingest check for a PAL_RLE ANIF body: 32-byte palette + (run, colorIdx)
+ *  pairs. Runs never cross row boundaries: 64 px per row, each row's runs sum to exactly
+ *  64, run is 1..64, colorIdx is 0..15, and the pairs cover all 2048 pixels. Violations
+ *  abort the upload so garbage never reaches flash. */
+static bool palRleBodyValid(const uint8_t *body, size_t len)
+{
+  if (len < PAL_RLE_PALETTE_BYTES || (len - PAL_RLE_PALETTE_BYTES) % 2 != 0)
+    return false;
+  const uint8_t *pairs = body + PAL_RLE_PALETTE_BYTES;
+  size_t pairCount = (len - PAL_RLE_PALETTE_BYTES) / 2;
+  size_t total = 0, row = 0;
+  for (size_t i = 0; i < pairCount; i++)
+  {
+    uint8_t run = pairs[2 * i];
+    if (run < 1 || run > W || pairs[2 * i + 1] > 15)
+      return false;
+    row += run;
+    total += run;
+    if (row > W)
+      return false; // this run crossed (or overshot) the row boundary
+    if (row == W)
+      row = 0;
+  }
+  return row == 0 && total == W * H;
 }
 
 void handleAnimFrame(const byte *payload, unsigned int length)
 {
-  if (!animUploading || length != ANIM_FRAME_PAYLOAD)
+  if (!animUploading)
+    return;
+  if (animUploadV2)
+  {
+    if (length < ANIM_FRAME_V2_MIN || length > ANIM_FRAME_V2_MAX)
+    {
+      abortAnimUpload(); // v2 frames are structurally checked at ingest
+      return;
+    }
+  }
+  else if (length != ANIM_FRAME_PAYLOAD)
     return;
 
   uint32_t magic;
@@ -756,6 +1135,19 @@ void handleAnimFrame(const byte *payload, unsigned int length)
   if (idx != animExpectedIdx)
     return;
 
+  size_t blobLen = length - 6; // frameFlags + body for v2, raw pixels for v1
+  if (animUploadV2)
+  {
+    if (idx >= animUploadCount)
+      return; // over-sent frame: the ANIM frameCount is authoritative
+    uint8_t frameFlags = payload[6];
+    if (frameFlags > 1 || (frameFlags == 1 && !palRleBodyValid(payload + 7, length - 7)))
+    {
+      abortAnimUpload();
+      return;
+    }
+  }
+
   // Ring only; the flash write happens in loop() (animUploadFlush). Flow control
   // (gated client.loop()) keeps a slot free, a full ring here means it failed.
   if (animRingCount >= ANIM_RING_FRAMES)
@@ -764,7 +1156,15 @@ void handleAnimFrame(const byte *payload, unsigned int length)
     return;
   }
 
-  memcpy(animRing[animRingHead], payload + 6, FRAME_BYTES);
+  memcpy(animRing[animRingHead], payload + 6, blobLen);
+  animRingLen[animRingHead] = blobLen;
+  if (animUploadV2)
+  {
+    // Blob offsets are deterministic in acceptance order, independent of flush timing:
+    // header + placeholder table + every previously accepted blob.
+    animFrameOffsets[idx] = SLOT_FILE_V2_HEADER_BYTES + (uint32_t)animUploadCount * 4 + animUploadBlobBytes;
+    animUploadBlobBytes += blobLen;
+  }
   animRingHead = (animRingHead + 1) % ANIM_RING_FRAMES;
   animRingCount++;
   animExpectedIdx++;
@@ -778,10 +1178,11 @@ void animUploadFlush()
   if (!animUploading)
     return;
 
-  size_t budget = animActive ? ANIM_FLUSH_CHUNK : FRAME_BYTES;
+  size_t budget = animActive ? ANIM_FLUSH_CHUNK : ANIM_RING_SLOT_BYTES;
   while (animRingCount > 0 && budget > 0)
   {
-    size_t chunk = FRAME_BYTES - animRingFlushed;
+    size_t slotLen = animRingLen[animRingTail];
+    size_t chunk = slotLen - animRingFlushed;
     if (chunk > budget)
       chunk = budget;
     if (!animUploadFile || animUploadFile.write(animRing[animRingTail] + animRingFlushed, chunk) != chunk)
@@ -792,7 +1193,7 @@ void animUploadFlush()
     }
     animRingFlushed += chunk;
     budget -= chunk;
-    if (animRingFlushed >= FRAME_BYTES)
+    if (animRingFlushed >= slotLen)
     {
       animRingFlushed = 0;
       animRingTail = (animRingTail + 1) % ANIM_RING_FRAMES;
@@ -809,6 +1210,27 @@ void completeAnimUpload()
 {
   Serial.println("Animation upload complete");
   animUploading = false; // before stopAnimation, so staging is preserved
+  if (animUploadV2)
+  {
+    animUploadV2 = false;
+    // Patch the placeholder offset table now that every blob has landed, while the
+    // staging handle is still open. A failed patch leaves an unplayable file — drop
+    // the whole upload instead; the server re-sends on its ack timeout.
+    bool ok = animUploadFile.seek(SLOT_FILE_V2_HEADER_BYTES);
+    for (uint16_t i = 0; ok && i < animUploadCount; i++)
+    {
+      uint32_t off = animFrameOffsets[i];
+      uint8_t e[4] = {(uint8_t)(off & 0xFF), (uint8_t)(off >> 8),
+                      (uint8_t)(off >> 16), (uint8_t)(off >> 24)};
+      ok = animUploadFile.write(e, sizeof(e)) == sizeof(e);
+    }
+    if (!ok)
+    {
+      animUploadFile.close();
+      LittleFS.remove(ANIM_UPLOAD_PATH);
+      return;
+    }
+  }
   animUploadFile.close();
 
   // Replacing the slot the animation is currently playing from: stop playback first,
@@ -822,6 +1244,7 @@ void completeAnimUpload()
     Serial.println("Animation rename failed");
     return;
   }
+  setSlotUploadId(animSlot, animUploadId); // slot content now matches this upload's hash
 
   // Ack the staging completion so the server knows the content landed.
   if (animStageOnly)
@@ -861,9 +1284,656 @@ void handleAnimPlay(const byte *payload, unsigned int length)
     return;
   }
 
-  // Play whatever the slot holds: the server only skips the upload when the slot's
-  // content is unchanged (persistent cache), so no id match is needed here.
+  // Content-hash gate: a non-zero uploadId means the server skipped the upload because
+  // it believes this slot already holds that content. Play only on an exact persisted-id
+  // match; on mismatch stay silent (no play, no ANIL) so the server's play-ack timeout
+  // falls back to an inline upload. A missing/corrupt slot file is also silent:
+  // startAnimation fails and never arms the ANIL. uploadId 0 keeps legacy behavior.
+  if (uploadId != 0 && animSlotUploadIds[slot] != uploadId)
+    return;
+
   playSlot(slot, uploadId);
+}
+
+// **************************************
+// ACMD v1 — parametric command engine
+//
+// Server-rendered command batches on <base>/cmd, executed on a RAM canvas that mirrors
+// Adafruit_GFX pixel-for-pixel (the server's Java preview renderer transcribes the same
+// algorithms from the same source): writeLine Bresenham with steep swap + err = dx/2,
+// fillRect as per-column vlines, drawCircle's 4 initial + 8 symmetric writes, int16
+// arithmetic, out-of-bounds pixels silently dropped. A whole batch renders into the
+// work canvas and commits atomically; any violation drops the batch and keeps the
+// prior display. The FIRST parametric primitive (SWEEP/SCROLL/BLINK) in a batch wins;
+// later ones are validated but ignored.
+// **************************************
+
+static inline uint16_t acmdU16(const uint8_t *p)
+{
+  return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static inline void acmdSwapI16(int16_t &a, int16_t &b)
+{
+  int16_t t = a;
+  a = b;
+  b = t;
+}
+
+/** Bounds-checked canvas write — the mirror of GFX drawPixel (drop, never clip-run). */
+static void acmdPixel(uint16_t *cv, int32_t x, int32_t y, uint16_t color)
+{
+  if (x >= 0 && x < W && y >= 0 && y < H)
+    cv[y * W + x] = color;
+}
+
+/** Adafruit_GFX::writeLine transcribed: steep swap, x0<=x1 ordering, err = dx/2. */
+static void acmdWriteLine(uint16_t *cv, int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint16_t color)
+{
+  int16_t adx = (x1 > x0) ? (x1 - x0) : (x0 - x1);
+  int16_t ady = (y1 > y0) ? (y1 - y0) : (y0 - y1);
+  bool steep = ady > adx;
+  if (steep)
+  {
+    acmdSwapI16(x0, y0);
+    acmdSwapI16(x1, y1);
+  }
+  if (x0 > x1)
+  {
+    acmdSwapI16(x0, x1);
+    acmdSwapI16(y0, y1);
+  }
+  int16_t dx = x1 - x0;
+  int16_t dy = (y1 > y0) ? (y1 - y0) : (y0 - y1);
+  int16_t err = dx / 2;
+  int16_t ystep = (y0 < y1) ? 1 : -1;
+  for (; x0 <= x1; x0++)
+  {
+    if (steep)
+      acmdPixel(cv, y0, x0, color);
+    else
+      acmdPixel(cv, x0, y0, color);
+    err -= dy;
+    if (err < 0)
+    {
+      y0 += ystep;
+      err += dx;
+    }
+  }
+}
+
+/** Adafruit_GFX::drawRect: four fast lines, each a writeLine. */
+static void acmdDrawRect(uint16_t *cv, int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color)
+{
+  acmdWriteLine(cv, x, y, x + w - 1, y, color);
+  acmdWriteLine(cv, x, y + h - 1, x + w - 1, y + h - 1, color);
+  acmdWriteLine(cv, x, y, x, y + h - 1, color);
+  acmdWriteLine(cv, x + w - 1, y, x + w - 1, y + h - 1, color);
+}
+
+/** Adafruit_GFX::fillRect: one vline per column. Degenerate sizes keep the GFX quirk:
+ *  h = 0 paints rows y-1 and y (swapped writeLine), w = 0 still iterates once per GFX. */
+static void acmdFillRect(uint16_t *cv, int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color)
+{
+  for (int16_t i = x; i < x + w; i++)
+    acmdWriteLine(cv, i, y, i, y + h - 1, color);
+}
+
+/** Adafruit_GFX::drawCircle transcribed: 4 initial writes + 8 symmetric per step. */
+static void acmdDrawCircle(uint16_t *cv, int16_t x0, int16_t y0, int16_t r, uint16_t color)
+{
+  int16_t f = 1 - r;
+  int16_t ddF_x = 1;
+  int16_t ddF_y = -2 * r;
+  int16_t x = 0;
+  int16_t y = r;
+
+  acmdPixel(cv, x0, y0 + r, color);
+  acmdPixel(cv, x0, y0 - r, color);
+  acmdPixel(cv, x0 + r, y0, color);
+  acmdPixel(cv, x0 - r, y0, color);
+
+  while (x < y)
+  {
+    if (f >= 0)
+    {
+      y--;
+      ddF_y += 2;
+      f += ddF_y;
+    }
+    x++;
+    ddF_x += 2;
+    f += ddF_x;
+
+    acmdPixel(cv, x0 + x, y0 + y, color);
+    acmdPixel(cv, x0 - x, y0 + y, color);
+    acmdPixel(cv, x0 + x, y0 - y, color);
+    acmdPixel(cv, x0 - x, y0 - y, color);
+    acmdPixel(cv, x0 + y, y0 + x, color);
+    acmdPixel(cv, x0 - y, y0 + x, color);
+    acmdPixel(cv, x0 + y, y0 - x, color);
+    acmdPixel(cv, x0 - y, y0 - x, color);
+  }
+}
+
+/** Draw one FONT-page glyph record (code,w,h,xAdvance,xOff,yOff + MSB-first bitmap):
+ *  pixels at (penX + xOff + gx, topY + yOff + gy); optional rect clip (SCROLL region). */
+static void acmdDrawGlyph(uint16_t *cv, const uint8_t *rec, int32_t penX, int32_t topY,
+                          uint16_t color, bool clip, int32_t cx, int32_t cy, int32_t cw, int32_t ch)
+{
+  int32_t w = rec[1];
+  int32_t h = rec[2];
+  int32_t ox = penX + (int8_t)rec[4];
+  int32_t oy = topY + (int8_t)rec[5];
+  const uint8_t *bmp = rec + 6;
+  for (int32_t gy = 0; gy < h; gy++)
+  {
+    for (int32_t gx = 0; gx < w; gx++)
+    {
+      if (!((bmp[gy * ((w + 7) / 8) + (gx >> 3)] >> (7 - (gx & 7))) & 1))
+        continue;
+      int32_t X = ox + gx;
+      int32_t Y = oy + gy;
+      if (clip && (X < cx || X >= cx + cw || Y < cy || Y >= cy + ch))
+        continue;
+      acmdPixel(cv, X, Y, color);
+    }
+  }
+}
+
+/** Whole-sequence parametric equality (epoch carry-over test): same count, order,
+ * types and every parameter — SCROLL text bytes included. */
+static bool acmdParamsEqual(const AcmdParam &a, const AcmdParam &b)
+{
+  if (a.type != b.type)
+    return false;
+  switch (a.type)
+  {
+  case ACMD_PARAM_SWEEP:
+    return a.u.sw.cx == b.u.sw.cx && a.u.sw.cy == b.u.sw.cy && a.u.sw.r == b.u.sw.r &&
+           a.u.sw.color == b.u.sw.color && a.u.sw.speed == b.u.sw.speed;
+  case ACMD_PARAM_SCROLL:
+    return a.u.sc.x == b.u.sc.x && a.u.sc.y == b.u.sc.y && a.u.sc.w == b.u.sc.w &&
+           a.u.sc.h == b.u.sc.h && a.u.sc.fontId == b.u.sc.fontId &&
+           a.u.sc.color == b.u.sc.color && a.u.sc.speedMs == b.u.sc.speedMs &&
+           a.u.sc.len == b.u.sc.len && memcmp(a.u.sc.text, b.u.sc.text, a.u.sc.len) == 0;
+  case ACMD_PARAM_BLINK:
+    return a.u.bl.x == b.u.bl.x && a.u.bl.y == b.u.bl.y && a.u.bl.w == b.u.bl.w &&
+           a.u.bl.h == b.u.bl.h && a.u.bl.periodMs == b.u.bl.periodMs;
+  default:
+    return false;
+  }
+}
+
+/** ACMD v1 batch parser. FIXED commands: opcode + fixed args. PAYLOAD commands
+ *  (BLIT/FONT/TEXT/SCROLL): opcode + payloadLen u16 LE + fixedArgs + payload, where
+ *  payloadLen counts ONLY the trailing payload bytes. Any opcode outside the v1 table
+ *  stops parsing and commits the parsed prefix; any truncation or out-of-bounds
+ *  argument drops the whole batch and keeps the prior display. */
+void handleAcmd(const byte *payload, unsigned int length)
+{
+  if (length < ACMD_HEADER_BYTES)
+    return;
+  uint32_t magic;
+  memcpy(&magic, payload, sizeof(magic));
+  if (magic != ACMD_MAGIC || payload[4] != ACMD_VERSION)
+    return;
+  uint16_t cmdCount = acmdU16(payload + 5);
+  size_t pos = ACMD_HEADER_BYTES;
+
+  memset(acmdWork, 0, sizeof(acmdWork)); // each batch fully describes the frame (starts black)
+
+  // Parametric candidates — collected during parse, applied to the live state only at
+  // commit so a dropped batch never corrupts a running overlay. Up to ACMD_PARAMS_MAX
+  // in command order; later ones are validated but ignored. Static storage: ~1 KB is
+  // too much for the MQTT callback's stack, and ACMD handling is single-threaded
+  // (loop task); candCount resets per call.
+  static AcmdParam cand[ACMD_PARAMS_MAX];
+  size_t candCount = 0;
+
+  bool stopParsing = false;
+  for (uint16_t ci = 0; ci < cmdCount && !stopParsing; ci++)
+  {
+    if (pos >= length)
+      return; // truncation → drop whole batch, keep prior display
+    uint8_t op = payload[pos++];
+    switch (op)
+    {
+    case ACMD_NOP:
+      break;
+
+    case ACMD_CLS:
+    {
+      if (pos + 2 > length)
+        return;
+      uint16_t color = acmdU16(payload + pos);
+      pos += 2;
+      for (size_t i = 0; i < W * H; i++)
+        acmdWork[i] = color;
+      break;
+    }
+
+    case ACMD_PIX:
+    {
+      if (pos + 4 > length)
+        return;
+      uint8_t x = payload[pos], y = payload[pos + 1];
+      uint16_t color = acmdU16(payload + pos + 2);
+      pos += 4;
+      acmdPixel(acmdWork, x, y, color);
+      break;
+    }
+
+    case ACMD_LINE:
+    {
+      if (pos + 6 > length)
+        return;
+      uint8_t x0 = payload[pos], y0 = payload[pos + 1], x1 = payload[pos + 2], y1 = payload[pos + 3];
+      uint16_t color = acmdU16(payload + pos + 4);
+      pos += 6;
+      acmdWriteLine(acmdWork, x0, y0, x1, y1, color);
+      break;
+    }
+
+    case ACMD_RECT:
+    {
+      if (pos + 6 > length)
+        return;
+      uint8_t x = payload[pos], y = payload[pos + 1], w = payload[pos + 2], h = payload[pos + 3];
+      uint16_t color = acmdU16(payload + pos + 4);
+      pos += 6;
+      acmdDrawRect(acmdWork, x, y, w, h, color);
+      break;
+    }
+
+    case ACMD_FILL:
+    {
+      if (pos + 6 > length)
+        return;
+      uint8_t x = payload[pos], y = payload[pos + 1], w = payload[pos + 2], h = payload[pos + 3];
+      uint16_t color = acmdU16(payload + pos + 4);
+      pos += 6;
+      acmdFillRect(acmdWork, x, y, w, h, color);
+      break;
+    }
+
+    case ACMD_CIRC:
+    {
+      if (pos + 5 > length)
+        return;
+      uint8_t cx = payload[pos], cy = payload[pos + 1], r = payload[pos + 2];
+      uint16_t color = acmdU16(payload + pos + 3);
+      pos += 5;
+      acmdDrawCircle(acmdWork, cx, cy, r, color);
+      break;
+    }
+
+    case ACMD_BLIT:
+    {
+      if (pos + 2 > length)
+        return;
+      uint16_t payLen = acmdU16(payload + pos);
+      pos += 2;
+      if (pos + 4 + (size_t)payLen > length)
+        return;
+      uint8_t x = payload[pos], y = payload[pos + 1], w = payload[pos + 2], h = payload[pos + 3];
+      pos += 4;
+      const uint8_t *pay = payload + pos;
+      pos += payLen;
+
+      if (payLen < PAL_RLE_PALETTE_BYTES || ((payLen - PAL_RLE_PALETTE_BYTES) & 1) != 0)
+        return;
+      uint16_t pal[16];
+      for (uint8_t c = 0; c < 16; c++)
+        pal[c] = acmdU16(pay + 2 * c);
+      // Structural validation: runs never cross rows, each row sums to exactly w,
+      // run 1..w, colorIdx 0..15, and the pairs cover all w*h pixels.
+      const uint8_t *pairs = pay + PAL_RLE_PALETTE_BYTES;
+      size_t pairCount = (payLen - PAL_RLE_PALETTE_BYTES) / 2;
+      uint16_t row = 0;
+      uint16_t rowsDone = 0;
+      for (size_t i = 0; i < pairCount; i++)
+      {
+        uint8_t run = pairs[2 * i], idx = pairs[2 * i + 1];
+        if (run < 1 || run > w || idx > 15)
+          return;
+        row += run;
+        if (row > w)
+          return;
+        if (row == w)
+        {
+          row = 0;
+          rowsDone++;
+        }
+      }
+      if (row != 0 || rowsDone != h)
+        return;
+      // Decode and blit at (x,y), canvas-clipped (out-of-bounds dropped).
+      uint16_t col = 0;
+      uint16_t rowIdx = 0;
+      for (size_t i = 0; i < pairCount; i++)
+      {
+        uint16_t color = pal[pairs[2 * i + 1]];
+        for (uint8_t k = 0; k < pairs[2 * i]; k++)
+        {
+          acmdPixel(acmdWork, (int32_t)x + col, (int32_t)y + rowIdx, color);
+          if (++col == w)
+          {
+            col = 0;
+            rowIdx++;
+          }
+        }
+      }
+      break;
+    }
+
+    case ACMD_FONT:
+    {
+      if (pos + 2 > length)
+        return;
+      uint16_t payLen = acmdU16(payload + pos);
+      pos += 2;
+      if (pos + (size_t)payLen > length)
+        return; // no fixed args for FONT
+      const uint8_t *pay = payload + pos;
+      pos += payLen;
+
+      if (payLen < 2)
+        return;
+      uint8_t pageId = pay[0], glyphCount = pay[1];
+      if (pageId >= ACMD_FONT_PAGES)
+        return;
+      // Pass 1: validate layout (w/h 1..32) and exact payload consumption.
+      size_t gpos = 2;
+      for (uint16_t g = 0; g < glyphCount; g++)
+      {
+        if (gpos + 6 > payLen)
+          return;
+        uint8_t w = pay[gpos + 1], h = pay[gpos + 2];
+        if (w < 1 || w > 32 || h < 1 || h > 32)
+          return;
+        gpos += 6 + (size_t)h * ((w + 7) / 8);
+      }
+      if (gpos != payLen)
+        return;
+      // Pass 2: stage the page, then swap in (a malloc failure keeps the old page).
+      size_t total = payLen - 2;
+      uint8_t *buf = total > 0 ? (uint8_t *)malloc(total) : nullptr;
+      if (total > 0 && !buf)
+        return;
+      static uint16_t tmpOff[256]; // single-threaded firmware: shared scratch is safe
+      for (uint16_t c = 0; c < 256; c++)
+        tmpOff[c] = ACMD_GLYPH_ABSENT;
+      if (total > 0)
+        memcpy(buf, pay + 2, total);
+      size_t off = 0;
+      for (uint16_t g = 0; g < glyphCount; g++)
+      {
+        tmpOff[buf[off]] = off; // duplicate codes: last one wins
+        off += 6 + (size_t)buf[off + 2] * ((buf[off + 1] + 7) / 8);
+      }
+      AcmdFontPage &pg = acmdFonts[pageId];
+      free(pg.glyphs);
+      pg.present = true;
+      pg.glyphs = buf;
+      pg.glyphsLen = total;
+      memcpy(pg.codeOff, tmpOff, sizeof(pg.codeOff));
+      break;
+    }
+
+    case ACMD_TEXT:
+    {
+      if (pos + 2 > length)
+        return;
+      uint16_t payLen = acmdU16(payload + pos);
+      pos += 2;
+      if (pos + 5 + (size_t)payLen > length)
+        return;
+      uint8_t fontId = payload[pos], x = payload[pos + 1], y = payload[pos + 2];
+      uint16_t color = acmdU16(payload + pos + 3);
+      pos += 5;
+      const uint8_t *pay = payload + pos;
+      pos += payLen;
+
+      if (fontId >= ACMD_FONT_PAGES)
+        return;
+      const AcmdFontPage &pg = acmdFonts[fontId];
+      if (!pg.present)
+        return; // missing page → drop batch
+      if (payLen < 1 || pay[0] < 1 || (size_t)payLen != 1 + pay[0])
+        return;
+      int32_t penX = x;
+      for (uint8_t i = 0; i < pay[0]; i++)
+      {
+        uint16_t off = pg.codeOff[pay[1 + i]];
+        if (off != ACMD_GLYPH_ABSENT)
+        {
+          acmdDrawGlyph(acmdWork, pg.glyphs + off, penX, y, color, false, 0, 0, 0, 0);
+          penX += (int8_t)pg.glyphs[off + 3];
+        }
+        else
+          penX += 4; // unknown glyph: advance, draw nothing
+      }
+      break;
+    }
+
+    case ACMD_SWEEP:
+    {
+      if (pos + 6 > length)
+        return;
+      uint8_t cx = payload[pos], cy = payload[pos + 1], r = payload[pos + 2];
+      uint16_t color = acmdU16(payload + pos + 3);
+      uint8_t speed = payload[pos + 5];
+      pos += 6;
+      if (speed < 1)
+        return; // spec: 1..255
+      if (candCount < ACMD_PARAMS_MAX)
+      {
+        AcmdParam &p = cand[candCount++];
+        p.type = ACMD_PARAM_SWEEP;
+        p.u.sw = {cx, cy, r, speed, color};
+      }
+      break;
+    }
+
+    case ACMD_SCROLL:
+    {
+      if (pos + 2 > length)
+        return;
+      uint16_t payLen = acmdU16(payload + pos);
+      pos += 2;
+      if (pos + 9 + (size_t)payLen > length)
+        return;
+      uint8_t x = payload[pos], y = payload[pos + 1], w = payload[pos + 2], h = payload[pos + 3];
+      uint8_t fontId = payload[pos + 4];
+      uint16_t color = acmdU16(payload + pos + 5);
+      uint16_t speedMs = acmdU16(payload + pos + 7);
+      pos += 9;
+      const uint8_t *pay = payload + pos;
+      pos += payLen;
+
+      if (fontId >= ACMD_FONT_PAGES)
+        return;
+      const AcmdFontPage &pg = acmdFonts[fontId];
+      if (!pg.present)
+        return; // missing page → drop batch
+      if (payLen < 1 || pay[0] < 1 || (size_t)payLen != 1 + pay[0])
+        return;
+      if (speedMs < 1)
+        return; // divide-by-zero guard
+      // textWidth = Σ advance: glyph xAdvance (signed), +4 per unknown glyph.
+      int32_t textW = 0;
+      for (uint8_t i = 0; i < pay[0]; i++)
+      {
+        uint16_t off = pg.codeOff[pay[1 + i]];
+        textW += (off != ACMD_GLYPH_ABSENT) ? (int8_t)pg.glyphs[off + 3] : 4;
+      }
+      if (candCount < ACMD_PARAMS_MAX)
+      {
+        AcmdParam &p = cand[candCount++];
+        p.type = ACMD_PARAM_SCROLL;
+        p.u.sc.x = x;
+        p.u.sc.y = y;
+        p.u.sc.w = w;
+        p.u.sc.h = h;
+        p.u.sc.fontId = fontId;
+        p.u.sc.color = color;
+        p.u.sc.speedMs = speedMs;
+        p.u.sc.len = pay[0];
+        memcpy(p.u.sc.text, pay + 1, p.u.sc.len);
+        p.u.sc.text[p.u.sc.len] = 0;
+        p.u.sc.textW = textW;
+      }
+      break;
+    }
+
+    case ACMD_BLINK:
+    {
+      if (pos + 6 > length)
+        return;
+      uint8_t x = payload[pos], y = payload[pos + 1], w = payload[pos + 2], h = payload[pos + 3];
+      uint16_t periodMs = acmdU16(payload + pos + 4);
+      pos += 6;
+      if (periodMs < 1)
+        return;
+      if (candCount < ACMD_PARAMS_MAX)
+      {
+        AcmdParam &p = cand[candCount++];
+        p.type = ACMD_PARAM_BLINK;
+        p.u.bl = {x, y, w, h, periodMs};
+      }
+      break;
+    }
+
+    default:
+      // Opcode not in the v1 table → stop parsing and commit the parsed prefix.
+      // (Forward-compat: future opcodes must be payload-form so extended parsers can
+      // skip them as fixedArgsLen + 2 + payloadLen; a v1 parser cannot, so it stops.)
+      stopParsing = true;
+      break;
+    }
+  }
+
+  // Commit: swap work into base, stop animation playback (slot files kept), arm the
+  // parametric sequence, push the frame. Everything after this point is live state.
+  // Epoch carry-over: a batch whose armed parametric SEQUENCE is identical to the live
+  // one (same count, order, types and parameters — SCROLL text included) keeps the
+  // previous epoch — every overlay's phase runs continuously across refresh
+  // republishes, so QoS-0 arrival jitter cannot snap the sweep back to 0° or restart a
+  // marquee mid-word. Any change (a different sequence, fewer/more parametrics, none),
+  // or anything that clears the ACMD state (stopAnimation clears acmdActive) arms all
+  // parametrics fresh. Decided BEFORE stopAnimation.
+  bool carryEpoch = acmdActive && acmdLiveCount == candCount && candCount > 0;
+  for (size_t i = 0; carryEpoch && i < candCount; i++)
+    carryEpoch = acmdParamsEqual(acmdLive[i], cand[i]);
+  memcpy(acmdBase, acmdWork, sizeof(acmdBase));
+  stopAnimation(false);
+  for (size_t i = 0; i < candCount; i++)
+    acmdLive[i] = cand[i];
+  acmdLiveCount = candCount;
+  acmdCommitMs = carryEpoch ? acmdCommitMs : millis(); // carry: keep the epoch
+  acmdLastDrawMs = acmdCommitMs; // carried epoch is old → next tick fires immediately
+  acmdActive = true;
+  currentScreenImage = ScreenImage::Client;
+  dma_display->drawRGBBitmap(0, 0, acmdWork, W, H);
+  Serial.printf("ACMD committed: %u commands%s\n", cmdCount,
+                acmdLiveCount == 0 ? "" : " + parametric");
+}
+
+/** Parametric overlay tick (~10 ms floor, called from loop()): composites ALL armed
+ * overlays over a fresh copy of the immutable base canvas and pushes it. All animation
+ * state derives from elapsed milliseconds since commit — never from tick counts — so
+ * loop cadence jitter cannot drift or stall a phase. Overlays apply in command order,
+ * so a later overlay draws over an earlier one where their regions overlap. */
+void acmdTick()
+{
+  if (!acmdActive || acmdLiveCount == 0)
+    return;
+  unsigned long now = millis();
+  if (now - acmdLastDrawMs < ACMD_TICK_MS)
+    return;
+  acmdLastDrawMs = now;
+  unsigned long elapsed = now - acmdCommitMs;
+
+  // Fresh base copy = the per-overlay "region snapshot restore" semantics.
+  memcpy(acmdWork, acmdBase, sizeof(acmdWork));
+  for (size_t pi = 0; pi < acmdLiveCount; pi++)
+  {
+    const AcmdParam &p = acmdLive[pi];
+    switch (p.type)
+    {
+    case ACMD_PARAM_SWEEP:
+    {
+      // θ = (elapsedMs × speed / 1000) mod 360; endpoint in double, lround (half away
+      // from zero); GFX line from the center over the base each tick.
+      uint32_t deg = (uint32_t)(((uint64_t)elapsed * p.u.sw.speed / 1000) % 360);
+      double rad = (double)deg * M_PI / 180.0;
+      int16_t ex = (int16_t)lround((double)p.u.sw.cx + (double)p.u.sw.r * cos(rad));
+      int16_t ey = (int16_t)lround((double)p.u.sw.cy + (double)p.u.sw.r * sin(rad));
+      acmdWriteLine(acmdWork, p.u.sw.cx, p.u.sw.cy, ex, ey, p.u.sw.color);
+      break;
+    }
+    case ACMD_PARAM_SCROLL:
+    {
+      // Ping-pong marquee with readability pacing: penX oscillates between the
+      // head-visible extreme (penX = x, tail clipped right) and the tail-visible
+      // extreme (penX = x + w − textW, head clipped left) — the text never leaves
+      // the region — HOLDING ACMD_SCROLL_HOLD_PX px-units of time at each extreme
+      // before reversing. One pass travels travel = textW − w px in at least
+      // ACMD_SCROLL_MIN_PASS_PX px-units (a barely-overflowing text glides instead
+      // of rattling); one px-unit is speedMs. Phase 0 = the head hold. A text that
+      // fits (textW ≤ w) has no travel: it renders statically at x.
+      int32_t travel = (int32_t)p.u.sc.textW - (int32_t)p.u.sc.w;
+      int32_t penX;
+      if (travel < 1)
+        penX = p.u.sc.x;
+      else
+      {
+        int32_t vt = travel < (int32_t)ACMD_SCROLL_MIN_PASS_PX ? (int32_t)ACMD_SCROLL_MIN_PASS_PX : travel;
+        uint32_t passMs = (uint32_t)vt * p.u.sc.speedMs;
+        uint32_t holdMs = (uint32_t)ACMD_SCROLL_HOLD_PX * p.u.sc.speedMs;
+        uint32_t cyc = elapsed % (2 * (holdMs + passMs));
+        int32_t pen; // px left of the head extreme, 0..travel
+        if (cyc < holdMs)
+          pen = 0; // head hold
+        else if (cyc < holdMs + passMs)
+          pen = (int32_t)((uint64_t)(cyc - holdMs) * (uint32_t)travel / passMs); // right → left pass
+        else if (cyc < 2 * holdMs + passMs)
+          pen = travel; // tail hold
+        else
+          pen = travel - (int32_t)((uint64_t)(cyc - 2 * holdMs - passMs) * (uint32_t)travel / passMs); // left → right pass
+        penX = p.u.sc.x - pen;
+      }
+      const AcmdFontPage &pg = acmdFonts[p.u.sc.fontId];
+      for (uint8_t gi = 0; gi < p.u.sc.len; gi++)
+      {
+        uint16_t off = pg.codeOff[(uint8_t)p.u.sc.text[gi]];
+        if (off != ACMD_GLYPH_ABSENT)
+        {
+          acmdDrawGlyph(acmdWork, pg.glyphs + off, penX, p.u.sc.y, p.u.sc.color,
+                        true, p.u.sc.x, p.u.sc.y, p.u.sc.w, p.u.sc.h);
+          penX += (int8_t)pg.glyphs[off + 3];
+        }
+        else
+          penX += 4;
+      }
+      break;
+    }
+    case ACMD_PARAM_BLINK:
+    {
+      // Alternate content ↔ black every periodMs/2; the first half shows content
+      // (content = the base copy already in acmdWork).
+      if ((elapsed % p.u.bl.periodMs) >= p.u.bl.periodMs / 2)
+        for (int16_t py = p.u.bl.y; py < p.u.bl.y + p.u.bl.h; py++)
+          for (int16_t px = p.u.bl.x; px < p.u.bl.x + p.u.bl.w; px++)
+            acmdPixel(acmdWork, px, py, 0);
+      break;
+    }
+    default:
+      break;
+    }
+  }
+  dma_display->drawRGBBitmap(0, 0, acmdWork, W, H);
 }
 
 void callback(char *topic, byte *payload, unsigned int length)
@@ -892,6 +1962,11 @@ void callback(char *topic, byte *payload, unsigned int length)
     if (strcmp(suffix, TOPIC_ANIM_PLAY) == 0)
     {
       handleAnimPlay(payload, length);
+      return;
+    }
+    if (strcmp(suffix, TOPIC_CMD) == 0)
+    {
+      handleAcmd(payload, length);
       return;
     }
   }
@@ -1064,12 +2139,15 @@ void reconnect()
       char animStartTopic[48];
       char animFrameTopic[48];
       char animPlayTopic[48];
+      char cmdTopic[48];
       snprintf(animStartTopic, sizeof(animStartTopic), "%s%s", getClientId(), TOPIC_ANIM_START);
       snprintf(animFrameTopic, sizeof(animFrameTopic), "%s%s", getClientId(), TOPIC_ANIM_FRAME);
       snprintf(animPlayTopic, sizeof(animPlayTopic), "%s%s", getClientId(), TOPIC_ANIM_PLAY);
+      snprintf(cmdTopic, sizeof(cmdTopic), "%s%s", getClientId(), TOPIC_CMD);
       Serial.printf("Subscribed to %s: %s\n", animStartTopic, client.subscribe(animStartTopic) ? "ok" : "FAILED");
       Serial.printf("Subscribed to %s: %s\n", animFrameTopic, client.subscribe(animFrameTopic) ? "ok" : "FAILED");
       Serial.printf("Subscribed to %s: %s\n", animPlayTopic, client.subscribe(animPlayTopic) ? "ok" : "FAILED");
+      Serial.printf("Subscribed to %s: %s\n", cmdTopic, client.subscribe(cmdTopic) ? "ok" : "FAILED"); // QoS 0
       if (animUploading)
         abortAnimUpload(); // an in-flight upload died with the connection; completed staging survives
       startAnimation(animPlayingSlot); // slot files persist across reconnects
@@ -1127,6 +2205,7 @@ void setup()
 
   LittleFS.remove(ANIM_UPLOAD_PATH); // any staging file is stale after a reboot
   LittleFS.remove("/anim.bin");      // legacy pre-slot animation file, reclaim its space
+  loadSlotUploadIds();               // slot content-hash index; invalid/missing file loads zeros (safe)
   Serial.printf("LittleFS: %u / %u bytes used\n",
                 (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes());
 
@@ -1218,6 +2297,7 @@ void loop()
     }
 
     animationTick();
+    acmdTick(); // parametric overlay (SWEEP/SCROLL/BLINK); no-op unless ACMD is active
   }
   else
   {
