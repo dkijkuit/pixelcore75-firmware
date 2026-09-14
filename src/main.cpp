@@ -27,6 +27,7 @@
 
 #include <BLEDevice.h>
 #include <BLEUtils.h>
+#include <BLESecurity.h>
 #include <BLEServer.h>
 
 #include "images.h"
@@ -68,7 +69,6 @@
 #define WF2_USB_DP_PIN 20
 
 #define MAX_PAYLOAD_SIZE 16384
-#define MAX_VALUES 8192
 
 #define FORMAT_LITTLE_FS_IF_FAILED true
 
@@ -83,7 +83,9 @@
 #define BUILD_NAME "PixelCore75"
 #define BUILD_VERSION "V.0.0.1"
 
-HUB75_I2S_CFG::i2s_pins _pins_x1 = {WF2_X1_R1_PIN, WF2_X1_G1_PIN, WF2_X1_B1_PIN, WF2_X1_R2_PIN, WF2_X1_G2_PIN, WF2_X1_B2_PIN, WF2_A_PIN, WF2_B_PIN, WF2_C_PIN, WF2_D_PIN, WF2_X1_E_PIN, WF2_LAT_PIN, WF2_OE_PIN, WF2_CLK_PIN};
+static constexpr size_t PREF_STR_MAX = 64; // NVS strings (SSID, password, MQTT host) + NUL
+static constexpr uint32_t BLE_PASSKEY = 240719; // pairing passkey; only valid when read off the panel
+
 HUB75_I2S_CFG::i2s_pins _pins_x2 = {WF2_X2_R1_PIN, WF2_X2_G1_PIN, WF2_X2_B1_PIN, WF2_X2_R2_PIN, WF2_X2_G2_PIN, WF2_X2_B2_PIN, WF2_A_PIN, WF2_B_PIN, WF2_C_PIN, WF2_D_PIN, WF2_X2_E_PIN, WF2_LAT_PIN, WF2_OE_PIN, WF2_CLK_PIN};
 
 MatrixPanel_I2S_DMA *dma_display = nullptr;
@@ -99,6 +101,8 @@ bool updateScreen = false;
 bool deviceConnected = false;
 bool bluetoothInitCompleted = false;
 bool buttonPressed = false;
+bool brokerConfigured = false;      // MQTT client one-time setup (server/callback) done
+bool mqttConnectingUiShown = false; // outage UI drawn once per disconnected period
 
 unsigned long lastReconnectAttempt = 0;
 
@@ -213,6 +217,11 @@ size_t animRingTail = 0;       // oldest buffered frame (reader: loop flusher)
 size_t animRingCount = 0;      // frames buffered
 size_t animRingFlushed = 0;    // bytes of the tail frame already written to flash
 
+// anim/start is staged here by the MQTT callback and handled from loop(): starting an
+// upload does LittleFS removes/creates (flash erases) that would stall playback inline.
+bool animStartPending = false;
+uint8_t animStartPayload[ANIM_START_PAYLOAD];
+
 // ACMD parametric command engine: batches render into the work canvas and commit
 // atomically (base canvas swap + display push + parametric arming). The base canvas is
 // immutable after commit, so parametric overlays (SWEEP/SCROLL/BLINK) composite over a
@@ -275,11 +284,8 @@ void init_bluetooth();
 void setAsciiValue(BLECharacteristic *ch, const String &val);
 void callback(char *topic, byte *payload, unsigned int length);
 void init_broker_connection();
-void writeFile(fs::FS &fs, const char *path, const uint16_t *intArray);
-void readFile(fs::FS &fs, const char *path);
 void reconnect();
 void init_display();
-void verifyRegistration();
 bool check_bluetooth_button_pressed();
 const char *getClientId();
 void stopAnimation(bool removeFile);
@@ -294,6 +300,36 @@ void handleAnimFrame(const byte *payload, unsigned int length);
 void handleAnimPlay(const byte *payload, unsigned int length);
 void handleAcmd(const byte *payload, unsigned int length);
 void acmdTick();
+
+/** Read a NUL-terminated byte blob from NVS into a fixed buffer. Replaces the previous
+ *  `char buf[preferences.getBytesLength(key)]` VLA pattern: on a factory-fresh panel the
+ *  keys are absent (getBytesLength() == 0) and a zero-sized VLA is undefined behavior.
+ *  Returns the string length (0 if unset). */
+static size_t readPrefString(const char *key, char *out, size_t outSize)
+{
+  if (outSize == 0)
+    return 0;
+  out[0] = '\0';
+  size_t len = preferences.getBytesLength(key);
+  if (len == 0)
+    return 0;
+  if (len > outSize)
+    len = outSize; // truncate over-long stored values
+  preferences.getBytes(key, out, len);
+  out[len - 1] = '\0'; // blobs are stored NUL-terminated; keep a terminator after truncation
+  return strlen(out);
+}
+
+/** Show the 6-digit BLE pairing passkey on the panel so only someone physically at it
+ *  can pair. Called from the BLE task (same convention as the connection callbacks). */
+static void drawPasskey(uint32_t passkey)
+{
+  dma_display->clearScreen();
+  currentScreenImage = ScreenImage::Client;
+  dma_display->setTextColor(dma_display->color565(255, 255, 0));
+  dma_display->setCursor(2, 22);
+  dma_display->printf("%06u", (unsigned)passkey);
+}
 
 void drawBitmap(
     int16_t x,
@@ -563,11 +599,32 @@ class BLEConnectionCallbacks : public BLEServerCallbacks
     drawBitmap(16, 0, epd_bitmap_bluetooth_icon, 32, 32, ScreenImage::Bluetooth, true);
     drawBitmap(40, 20, epd_bitmap_red_cross, 7, 7, ScreenImage::Cross, false);
 
-    delay(2000);
+    // This callback runs in the BLE stack task: never delay()/ESP.restart() here (the
+    // old reboot killed any playing animation on every disconnect). Just advertise
+    // again so the app can reconnect.
+    BLEDevice::startAdvertising();
+  }
+};
 
-    BLEDevice::stopAdvertising();
-
-    ESP.restart();
+/** Passkey pairing for BLE provisioning: without it anyone in radio range could rewrite
+ *  the WiFi/MQTT/brightness config. IO_CAP_OUT (display-only) + MITM makes the peer
+ *  type the passkey this panel shows on the matrix, so pairing needs physical presence.
+ *  OS-level pairing — the companion app needs no code or UUID changes. */
+class BLESecurityCallbacksImpl : public BLESecurityCallbacks
+{
+  uint32_t onPassKeyRequest() override
+  {
+    Serial.printf("BLE pairing passkey: %u\n", (unsigned)BLE_PASSKEY);
+    drawPasskey(BLE_PASSKEY);
+    return BLE_PASSKEY;
+  }
+  void onPassKeyNotify(uint32_t passkey) override {}
+  bool onSecurityRequest() override { return true; }
+  bool onConfirmPIN(uint32_t passkey) override { return false; } // not used with IO_CAP_OUT
+  void onAuthenticationComplete(esp_ble_auth_cmpl_t auth_cmpl) override
+  {
+    Serial.printf("BLE authentication %s\n",
+                  auth_cmpl.success ? "succeeded" : "failed");
   }
 };
 
@@ -619,6 +676,11 @@ void init_bluetooth()
     restartCharacteristic->addDescriptor(restartDesc);
 
     pServer->setCallbacks(new BLEConnectionCallbacks());
+    BLEDevice::setSecurityCallbacks(new BLESecurityCallbacksImpl());
+    BLESecurity security; // setters apply the GAP params immediately (stack is up here)
+    security.setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM);
+    security.setCapability(ESP_IO_CAP_OUT);
+    security.setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
     serverCharacteristic->setCallbacks(new ServerCharacteristicCallBack());
     serverPortCharacteristic->setCallbacks(new ServerPortCharacteristicCallBack());
     ssidCharacteristic->setCallbacks(new SsidCharacteristicCallBack());
@@ -626,12 +688,12 @@ void init_bluetooth()
     brightnessCharacteristic->setCallbacks(new BrightnessCharacteristicCallBack());
     restartCharacteristic->setCallbacks(new RestartCharacteristicCallBack());
 
-    char ssid[preferences.getBytesLength("wifissid")] = {};
-    preferences.getBytes("wifissid", ssid, preferences.getBytesLength("wifissid"));
+    char ssid[PREF_STR_MAX];
+    readPrefString("wifissid", ssid, sizeof(ssid));
     ssidCharacteristic->setValue(ssid);
 
-    char server[preferences.getBytesLength("server")] = {};
-    preferences.getBytes("server", server, preferences.getBytesLength("server"));
+    char server[PREF_STR_MAX];
+    readPrefString("server", server, sizeof(server));
     serverCharacteristic->setValue(server);
 
     uint16_t port = preferences.getUShort("server_port", 1883);
@@ -772,7 +834,11 @@ void stopAnimation(bool removePlayingSlot)
   if (animFile)
     animFile.close();
   if (removePlayingSlot)
+  {
     LittleFS.remove(animSlotPath(animPlayingSlot));
+    setSlotUploadId(animPlayingSlot, 0); // index must not claim content for a deleted file,
+                                         // or the ANIP hash fast path plays a missing slot
+  }
   if (wasUploading)
     abortAnimUpload(); // staging is stale once the upload state resets
 }
@@ -1951,7 +2017,15 @@ void callback(char *topic, byte *payload, unsigned int length)
     const char *suffix = topic + baseLen;
     if (strcmp(suffix, TOPIC_ANIM_START) == 0)
     {
-      handleAnimStart(payload, length);
+      // Defer to loop(): handleAnimStart does LittleFS removes/creates (flash erases)
+      // that stall playback inline. Ordering is safe — PubSubClient delivers one publish
+      // per client.loop() call, and loop() runs the staged start before the next
+      // client.loop() can deliver the first frame.
+      if (length == ANIM_START_PAYLOAD)
+      {
+        memcpy(animStartPayload, payload, length);
+        animStartPending = true;
+      }
       return;
     }
     if (strcmp(suffix, TOPIC_ANIM_FRAME) == 0)
@@ -1971,7 +2045,9 @@ void callback(char *topic, byte *payload, unsigned int length)
     }
   }
 
+#ifdef PC75_LOG_FRAMES
   Serial.printf("Received %u bytes on topic %s\n", length, topic);
+#endif
 
   if (length > MAX_PAYLOAD_SIZE)
   {
@@ -1993,17 +2069,23 @@ void callback(char *topic, byte *payload, unsigned int length)
   dma_display->drawRGBBitmap(0, 0, px, W, H);
 }
 
+/** One-time MQTT client configuration. Never connects and never draws/delays here: a
+ *  down broker must not block setup()/loop(). reconnect() owns the throttled attempts
+ *  and loop() draws the outage UI once per disconnected period. */
 void init_broker_connection()
 {
+  if (brokerConfigured)
+    return;
+  brokerConfigured = true;
+  updateScreen = true;
+
   Serial.println("Connected to Wifi, connecting to broker...");
+  Serial.println(WiFi.localIP());
 
-  drawBitmap(0, 0, epd_bitmap_connecting, 64, 32, ScreenImage::Connecting, true);
-  delay(2000);
-
-  client.setBufferSize(16384);
-
-  char server[preferences.getBytesLength("server")] = {};
-  preferences.getBytes("server", server, preferences.getBytesLength("server"));
+  // static: PubSubClient::setServer only stores the pointer, so the buffer must
+  // outlive this function or connect() resolves DNS through dangling stack memory
+  static char server[PREF_STR_MAX];
+  readPrefString("server", server, sizeof(server));
 
   const uint16_t mqtt_port = preferences.getUShort("server_port", 1883);
 
@@ -2014,13 +2096,6 @@ void init_broker_connection()
 
   client.setServer(server, mqtt_port);
   client.setCallback(callback);
-
-  if (!client.connected())
-  {
-    updateScreen = true;
-    Serial.println(WiFi.localIP());
-    reconnect();
-  }
 }
 
 const char *getClientId()
@@ -2052,72 +2127,6 @@ const char *getClientId()
   }
 
   return client_id;
-}
-
-void writeFile(fs::FS &fs, const char *path, const uint16_t *intArray)
-{
-  Serial.printf("Writing file: %s\r\n", path);
-
-  // if(!fs.exists(path)) {
-  //  Define your uint16_t array
-  size_t dataSize = 2048 * sizeof(uint16_t);
-
-  Serial.print("Estimated size: ");
-  Serial.println(dataSize);
-
-  // Open file for binary writing
-  File file = LittleFS.open(path, FILE_WRITE);
-  if (!file)
-  {
-    Serial.println("Failed to open file for writing");
-    return;
-  }
-
-  // Write the array as binary data
-  size_t written = file.write((const uint8_t *)intArray, dataSize);
-  file.close();
-
-  // Check if all data was written
-  if (written == dataSize)
-  {
-    Serial.print("Data written successfully: ");
-    Serial.println(written);
-  }
-  else
-  {
-    Serial.printf("Only %u of %u bytes written.\n", written, dataSize);
-  }
-  // } else {
-  //   Serial.println("File already on filesystem, skipping write!");
-  // }
-}
-
-void readFile(fs::FS &fs, const char *path)
-{
-  Serial.printf("Reading file: %s\r\n", path);
-
-  File file = LittleFS.open(path, FILE_READ);
-  if (!file)
-  {
-    Serial.println("Failed to open file for reading");
-    return;
-  }
-
-  const size_t numElements = 2048;
-  uint16_t readBuffer[numElements];
-
-  size_t bytesRead = file.read((uint8_t *)readBuffer, sizeof(readBuffer));
-  file.close();
-
-  if (bytesRead == sizeof(readBuffer))
-  {
-    Serial.println("Data read successfully:");
-    drawBitmap(0, 0, readBuffer, 64, 32, ScreenImage::Client, true);
-  }
-  else
-  {
-    Serial.printf("Only %u of %u bytes read.\n", bytesRead, sizeof(readBuffer));
-  }
 }
 
 void reconnect()
@@ -2154,7 +2163,8 @@ void reconnect()
     }
     else
     {
-      drawBitmap(0, 0, epd_bitmap_connecting, 64, 32, ScreenImage::Connecting, true);
+      // No redraw here: the outage UI is drawn once by loop() (and only when no
+      // animation is playing); redrawing per failed attempt would fight it.
       Serial.print("failed, rc=");
       Serial.print(client.state());
     }
@@ -2179,16 +2189,13 @@ void init_display()
   dma_display->clearScreen();
 }
 
-void verifyRegistration()
-{
-  uint64_t device_id = ESP.getEfuseMac();
-}
-
 void setup()
 {
   Serial.begin(115200);
 
-  pinMode(17, INPUT_PULLUP);
+  pinMode(WF2_BUTTON_TEST, INPUT_PULLUP);
+
+  client.setBufferSize(MAX_PAYLOAD_SIZE); // once: per-reconnect reallocs fragment the heap
 
   Serial.println("********************************************");
   Serial.print("* ");
@@ -2211,11 +2218,10 @@ void setup()
 
   preferences.begin("cryptoticker", false);
 
-  char ssid[preferences.getBytesLength("wifissid")] = {};
-  char password[preferences.getBytesLength("wifipass")] = {};
-
-  preferences.getBytes("wifissid", ssid, preferences.getBytesLength("wifissid"));
-  preferences.getBytes("wifipass", password, preferences.getBytesLength("wifipass"));
+  char ssid[PREF_STR_MAX];
+  char password[PREF_STR_MAX];
+  readPrefString("wifissid", ssid, sizeof(ssid));
+  readPrefString("wifipass", password, sizeof(password));
 
   init_display();
 
@@ -2238,7 +2244,6 @@ void setup()
 
       if (init_wifi(ssid, password))
       {
-        verifyRegistration();
         init_broker_connection();
       }
     }
@@ -2251,7 +2256,7 @@ void setup()
 
 bool check_bluetooth_button_pressed()
 {
-  if (digitalRead(17) == LOW && !buttonPressed)
+  if (digitalRead(WF2_BUTTON_TEST) == LOW && !buttonPressed)
   {
     Serial.println("Bluetooth button pressed");
     updateScreen = false;
@@ -2268,10 +2273,33 @@ void loop()
 
   if (hasWifi && !buttonPressed && updateScreen)
   {
+    // Non-blocking reconnect state machine: configure once, draw the outage UI once per
+    // disconnected period, then rely on reconnect()'s 5 s throttle. A broker outage must
+    // not spin the loop with delays/redraws that clobber a playing animation.
     if (!client.connected())
     {
       init_broker_connection();
+      if (!mqttConnectingUiShown)
+      {
+        mqttConnectingUiShown = true;
+        if (!animActive) // a playing slot animation already shows life; don't clobber it
+          drawBitmap(0, 0, epd_bitmap_connecting, 64, 32, ScreenImage::Connecting, true);
+      }
+      reconnect();
     }
+    else
+    {
+      mqttConnectingUiShown = false;
+    }
+
+    // Staged by the MQTT callback, run here before the next client.loop() can deliver
+    // the first ANIF: flash erases never run inside the callback.
+    if (animStartPending && client.connected())
+    {
+      animStartPending = false;
+      handleAnimStart(animStartPayload, ANIM_START_PAYLOAD);
+    }
+
     animUploadFlush(); // make ring space before pulling more frames off the socket
 
     // Flow control: with the ring nearly full, hold off client.loop() (which delivers
